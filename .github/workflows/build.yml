@@ -1,0 +1,34 @@
+name: Build firmware
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib ninja-build cmake
+
+      - name: Fetch Pico SDK
+        run: |
+          git clone --depth 1 https://github.com/raspberrypi/pico-sdk "$RUNNER_TEMP/pico-sdk"
+          git -C "$RUNNER_TEMP/pico-sdk" submodule update --init --depth 1 lib/btstack lib/tinyusb lib/cyw43-driver lib/lwip lib/mbedtls
+
+      - name: Build
+        env:
+          PICO_SDK_PATH: ${{ runner.temp }}/pico-sdk
+        run: |
+          cmake -S . -B build -G Ninja -DPICO_BOARD=pico2_w
+          cmake --build build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mc_bluebridge-${{ github.sha }}
+          path: build/mc_bluebridge.uf2
