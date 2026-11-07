@@ -109,6 +109,16 @@ During normal operation:
 
 This is especially useful when the adapter is connected to a Nintendo Switch or Switch 2.
 
+In this test build, quick presses of BOOTSEL also work:
+
+| Presses | Action |
+|---|---|
+| 1 | Start or stop pairing |
+| 2 | Switch to X-Input mode |
+| 3 | Switch to DualSense mode |
+
+The LED flashes briefly when the output mode changes.
+
 Holding BOOTSEL while plugging the Pico into USB still enters the normal Raspberry Pi bootloader.
 
 ## Controller support

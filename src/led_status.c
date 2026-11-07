@@ -21,7 +21,6 @@ static void timer_handler(btstack_timer_source_t* ts) {
     (void)ts;
     tick++;
     uint32_t now = to_ms_since_boot(get_absolute_time());
-    bb_bootsel_poll(now);
     int on = 0;
     if (error_state) {
         on = (tick & 1u) == 0;
@@ -55,6 +54,8 @@ void bb_led_init(void) {
     btstack_run_loop_set_timer_handler(&timer, timer_handler);
     btstack_run_loop_set_timer(&timer, 100);
     btstack_run_loop_add_timer(&timer);
+    // The BOOTSEL button has its own faster timer, to catch quick presses.
+    bb_bootsel_init();
 }
 
 void bb_led_signal_profile_changed(void) {
