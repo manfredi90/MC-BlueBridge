@@ -31,8 +31,11 @@ typedef enum {
     BB_OUTPUT_XINPUT = 2,
     BB_OUTPUT_GENERIC_HID = 3,
     BB_OUTPUT_SWITCH = 4,
-    BB_OUTPUT_XBOX360 = 5,
-    BB_OUTPUT_DUALSENSE = 6
+    // Test build: DualSense takes number 5 so that tools that only know modes
+    // 1-5 (MiSTer Companion) can select it. Xbox 360 (Console) is moved out of
+    // the valid range and cannot be selected.
+    BB_OUTPUT_DUALSENSE = 5,
+    BB_OUTPUT_XBOX360 = 6
 } bb_output_mode_t;
 
 #define BB_OUTPUT_LAST BB_OUTPUT_DUALSENSE

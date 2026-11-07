@@ -200,7 +200,7 @@ This is the recommended mode on **macOS**: macOS supports the DualSense natively
 
 Buttons follow BlueBridge's positional layout: South is Cross, East is Circle, West is Square, North is Triangle, Select is Create, Start is Options and Home is the PS button. The motion sensors report a controller lying still, and the touchpad reports no touches.
 
-Select the mode by its number (`6`) with the management command `BB1|1|OUTPUT_SET|6`. BlueBridge also exposes its management interface next to the controller in this mode. To return to MiSTer mode without a management connection, hold **BOOTSEL for 5 seconds** during normal operation.
+Select the mode by its number (`5`) with the management command `BB1|1|OUTPUT_SET|5`. In this test build DualSense replaces Xbox 360 (Console) as mode 5, so management tools that list the Xbox 360 (Console) mode select DualSense instead; Xbox 360 (Console) cannot be selected. BlueBridge also exposes its management interface next to the controller in this mode. To return to MiSTer mode without a management connection, hold **BOOTSEL for 5 seconds** during normal operation.
 
 Changing USB output mode is persistent and automatically re-enumerates BlueBridge with the appropriate USB identity.
 
