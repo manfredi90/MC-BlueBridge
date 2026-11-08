@@ -184,6 +184,8 @@ Useful for Windows and other software designed around Xbox controllers.
 
 Analog triggers and rumble are supported where available.
 
+In this test build, X-Input mode uses the pid.codes open-source USB vendor ID (1209) instead of Raspberry Pi's, so that Linux's Xbox controller driver, and therefore MiSTer, recognises it too. MiSTer Companion does not detect the adapter while this mode is active: hold **BOOTSEL for 5 seconds** to return to MiSTer mode and manage it.
+
 ### Generic HID
 
 Presents BlueBridge as a standard USB HID gamepad.

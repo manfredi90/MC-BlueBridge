@@ -35,8 +35,13 @@ uint8_t const* tud_descriptor_device_cb(void) {
     } else if (mode == BB_OUTPUT_MISTER) {
         device_desc.idProduct = (uint16_t)(0xB000u | (bb_current_mister_identity() & 0x0fffu));
     } else if (mode == BB_OUTPUT_XINPUT) {
-        device_desc.idVendor = 0x2E8A;
-        device_desc.idProduct = 0x10B2;
+        // Test build: use the pid.codes open-source vendor ID (with a pid.codes
+        // test PID) instead of Raspberry Pi's. Linux's xpad driver only binds
+        // X-Input interfaces from vendors on its list; 0x1209 is on it, 0x2E8A is
+        // not, so MiSTer (and other Linux hosts) did not recognise this mode.
+        // Windows still binds through the XUSB10 Microsoft OS descriptor.
+        device_desc.idVendor = 0x1209;
+        device_desc.idProduct = 0x0005;
         device_desc.bcdDevice = 0x0101;
     } else if (mode == BB_OUTPUT_XBOX360) {
         device_desc.bDeviceClass = 0xff;
