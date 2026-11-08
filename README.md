@@ -117,7 +117,7 @@ In this test build, quick presses of BOOTSEL also work:
 | 2 | Switch to X-Input mode |
 | 3 | Switch to DualSense mode |
 
-The LED flashes briefly when the output mode changes.
+Holding BOOTSEL for 5 seconds returns to MiSTer mode from any output mode. The LED flashes briefly when the output mode changes.
 
 Holding BOOTSEL while plugging the Pico into USB still enters the normal Raspberry Pi bootloader.
 

@@ -16,7 +16,7 @@
 //   2 short presses         X-Input output mode
 //   3 short presses         DualSense output mode
 //   hold 1 s                start/stop pairing
-//   hold 5 s                back to MiSTer mode (from X-Input, Xbox 360 or DualSense mode)
+//   hold 5 s                back to MiSTer mode (from any output mode)
 
 #define BOOTSEL_POLL_MS 20u
 #define BOOTSEL_DEBOUNCE_MS 30u
@@ -112,12 +112,13 @@ void bb_bootsel_poll(uint32_t now) {
         clicks = 0;
         toggle_pairing();
     }
-    if (!recovery_action && held >= BOOTSEL_HOLD_RECOVERY_MS &&
-        (bb_output_mode() == BB_OUTPUT_XBOX360 || bb_output_mode() == BB_OUTPUT_DUALSENSE ||
-         bb_output_mode() == BB_OUTPUT_XINPUT)) {
+    if (!recovery_action && held >= BOOTSEL_HOLD_RECOVERY_MS) {
         recovery_action = true;
         bb_platform_stop_pairing();
-        if (bb_output_mode_set(BB_OUTPUT_MISTER)) bb_usb_request_reenumeration();
+        if (bb_output_mode() != BB_OUTPUT_MISTER && bb_output_mode_set(BB_OUTPUT_MISTER)) {
+            bb_led_signal_profile_changed();
+            bb_usb_request_reenumeration();
+        }
     }
 }
 
