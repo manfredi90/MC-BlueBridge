@@ -454,6 +454,20 @@ static int16_t n64_axis(uint16_t value, unsigned axis) {
     return axis12_quantized(value, n64_center[axis], range);
 }
 
+// Test build: Switch Online N64 controllers (and the 8BitDo 64 in Switch mode)
+// report the C buttons as buttons 2 (left), 3 (right), 7 (down) and 11 (up);
+// turn them into the right stick, as SDL and N64 emulators expect.
+#define N64_C_BUTTONS ((1u << 2) | (1u << 3) | (1u << 7) | (1u << 11))
+#define N64_BUTTON_CAPABILITIES (0x00003effu & ~N64_C_BUTTONS)
+
+static void n64_c_buttons_to_stick(bb_input_state_t* s) {
+    if (s->buttons & (1u << 2)) s->rx -= 32767;
+    if (s->buttons & (1u << 3)) s->rx += 32767;
+    if (s->buttons & (1u << 11)) s->ry -= 32767;
+    if (s->buttons & (1u << 7)) s->ry += 32767;
+    s->buttons &= ~N64_C_BUTTONS;
+}
+
 static bool parse_n64_full(const uint8_t* p, uint16_t len) {
     if (len < 13) return false;
     bb_input_state_t s;
@@ -483,7 +497,8 @@ static bool parse_n64_full(const uint8_t* p, uint16_t len) {
     uint8_t battery = p[2] >> 4;
     uint8_t level = battery & 0x0e;
     bb_state_update_battery(true, level >= 8 ? 100 : level * 100u / 8u, (battery & 1) ? 2 : 1);
-    bb_state_update_button_capabilities(0x00003effu);
+    n64_c_buttons_to_stick(&s);
+    bb_state_update_button_capabilities(N64_BUTTON_CAPABILITIES);
     submit_state(&s);
     return true;
 }
@@ -503,7 +518,8 @@ static bool parse_n64_simple(const uint8_t* report, uint16_t length) {
     state.y = hid_axis(little_endian_read_16(report, 6), 0, 65535);
     state.lt = (state.buttons & (1u << 6)) ? 255 : 0;
     state.rt = (state.buttons & (1u << 10)) ? 255 : 0;
-    bb_state_update_button_capabilities(0x00003effu);
+    n64_c_buttons_to_stick(&state);
+    bb_state_update_button_capabilities(N64_BUTTON_CAPABILITIES);
     submit_state(&state);
     return true;
 }
