@@ -456,9 +456,10 @@ static int16_t n64_axis(uint16_t value, unsigned axis) {
 
 // Test build: Switch Online N64 controllers (and the 8BitDo 64 in Switch mode)
 // report the C buttons as buttons 2 (left), 3 (right), 7 (down) and 11 (up);
-// turn them into the right stick, as SDL and N64 emulators expect.
+// turn them into the right stick, as SDL and N64 emulators expect. ZR, parsed
+// as button 10 (which outputs as L3), then moves to button 7, the R2 position.
 #define N64_C_BUTTONS ((1u << 2) | (1u << 3) | (1u << 7) | (1u << 11))
-#define N64_BUTTON_CAPABILITIES (0x00003effu & ~N64_C_BUTTONS)
+#define N64_BUTTON_CAPABILITIES ((0x00003effu & ~N64_C_BUTTONS & ~(1u << 10)) | (1u << 7))
 
 static void n64_c_buttons_to_stick(bb_input_state_t* s) {
     if (s->buttons & (1u << 2)) s->rx -= 32767;
@@ -466,6 +467,10 @@ static void n64_c_buttons_to_stick(bb_input_state_t* s) {
     if (s->buttons & (1u << 11)) s->ry -= 32767;
     if (s->buttons & (1u << 7)) s->ry += 32767;
     s->buttons &= ~N64_C_BUTTONS;
+    if (s->buttons & (1u << 10)) {
+        s->buttons &= ~(1u << 10);
+        s->buttons |= 1u << 7;
+    }
 }
 
 static bool parse_n64_full(const uint8_t* p, uint16_t len) {

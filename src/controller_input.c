@@ -117,7 +117,9 @@ void bb_input_submit(const bb_input_state_t* state) {
     bb_controller_t controller;
     bb_active_controller_get(&controller, NULL);
     bb_controller_kind_t kind = bb_controller_identify(controller.native_vendor_id, controller.native_product_id, controller.name);
-    uint8_t right_trigger_input = kind == BB_CONTROLLER_NSO_N64 ? 10 : 7;
+    // Test build: N64 ZR now arrives as button 7 like every other right trigger.
+    (void)kind;
+    uint8_t right_trigger_input = 7;
     report.hat = bb_hat_from_dpad(state->dpad);
     uint16_t mapped = 0;
     uint32_t pressed_edges = state->buttons & ~previous_inputs;
@@ -260,7 +262,7 @@ const char* bb_controller_button_label(bb_controller_kind_t kind, const char* na
     static const char* gamecube[BB_BUTTON_COUNT] = {"B","A","Y","X","ZL","ZR","L","R","Unused","Start","Unused","Unused","Home","Capture","C","Unused","Unused","Unused","Unused","Unused","Unused","Unused","Unused","Unused","Unused","Unused"};
     static const char* switch2[BB_BUTTON_COUNT] = {"B","A","Y","X","L","R","ZL","ZR","Minus","Plus","L Stick","R Stick","Home","Capture","GL","GR","C","L4","R4","L5","P1","P2","P3","P4","Aux 1","Aux 2"};
     static const char* stadia[BB_BUTTON_COUNT] = {"A","B","X","Y","L1","R1","L2","R2","Options","Menu","L3","R3","Stadia","Capture","Assistant","Extra","L4","R4","L5","R5","P1","P2","P3","P4","Aux 1","Aux 2"};
-    static const char* n64[BB_BUTTON_COUNT] = {"A","B","Unused","Unused","L","R","Z","Unused","Unused","Start","ZR","Unused","Home","Capture","L4","R4","L5","R5","P1","P2","P3","P4","A3","A4","Aux 1","Aux 2"};
+    static const char* n64[BB_BUTTON_COUNT] = {"A","B","Unused","Unused","L","R","Z","ZR","Unused","Start","Unused","Unused","Home","Capture","L4","R4","L5","R5","P1","P2","P3","P4","A3","A4","Aux 1","Aux 2"};
     static const char* snes[BB_BUTTON_COUNT] = {"B","A","Y","X","L","R","ZL","ZR","Select","Start","L Stick","R Stick","Home","Capture","L4","R4","L5","R5","P1","P2","P3","P4","A3","A4","Aux 1","Aux 2"};
     static const char* nes[BB_BUTTON_COUNT] = {"B","A","Y","X","L","R","ZL","ZR","Select","Start","L Stick","R Stick","Home","Capture","L4","R4","L5","R5","P1","P2","P3","P4","A3","A4","Aux 1","Aux 2"};
     static const char* genesis[BB_BUTTON_COUNT] = {"B","C","A","X","Y","Z","L","R","Mode","Start","L Stick","R Stick","Home","Capture","L4","R4","L5","R5","P1","P2","P3","P4","A3","A4","Aux 1","Aux 2"};
@@ -364,8 +366,7 @@ bb_controller_capabilities_t bb_controller_capabilities(bb_controller_kind_t kin
             break;
         case BB_CONTROLLER_NSO_N64:
             // Test build: C buttons are reported as the right stick.
-            c.buttons = 0x00003673u;
-            c.right_trigger = 0;
+            c.buttons = 0x000032f3u;
             break;
         case BB_CONTROLLER_NSO_GENESIS:
             c.buttons = 0x0000333fu;
