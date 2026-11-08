@@ -975,8 +975,24 @@ bool bb_controller_select(uint8_t index) {
     return ok;
 }
 
+static volatile uint8_t auto_effective_mode = BB_OUTPUT_XINPUT;
+static volatile uint32_t auto_generation;
+
+void bb_output_auto_set_effective(bb_output_mode_t mode) {
+    auto_effective_mode = (uint8_t)mode;
+}
+
+uint32_t bb_output_auto_generation(void) {
+    return auto_generation;
+}
+
 bool bb_output_mode_set(bb_output_mode_t mode) {
     if (mode < BB_OUTPUT_MISTER || mode > BB_OUTPUT_LAST || (boot_multi && mode != BB_OUTPUT_MISTER)) return false;
+    if (mode == BB_OUTPUT_AUTO) {
+        // Restart the detection from X-Input.
+        auto_effective_mode = BB_OUTPUT_XINPUT;
+        ++auto_generation;
+    }
     critical_section_enter_blocking(&lock);
     config_state.output_mode = (uint8_t)mode;
     config_save_pending = true;
@@ -1000,7 +1016,9 @@ uint16_t bb_current_mister_identity(void) {
 }
 
 bb_output_mode_t bb_output_mode(void) {
-    return (bb_output_mode_t)bb_output_mode_value();
+    uint8_t mode = bb_output_mode_value();
+    if (mode == BB_OUTPUT_AUTO) return (bb_output_mode_t)auto_effective_mode;
+    return (bb_output_mode_t)mode;
 }
 
 const char* bb_output_mode_name(bb_output_mode_t mode) {
@@ -1011,6 +1029,7 @@ const char* bb_output_mode_name(bb_output_mode_t mode) {
         case BB_OUTPUT_SWITCH: return "Nintendo Switch";
         case BB_OUTPUT_XBOX360: return "Xbox 360 (Console)";
         case BB_OUTPUT_DUALSENSE: return "DualSense";
+        case BB_OUTPUT_AUTO: return "Auto";
         default: return "MiSTer";
     }
 }

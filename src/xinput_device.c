@@ -2,6 +2,7 @@
 #include "bt_host.h"
 #include "bluebridge_state.h"
 #include "xbox360_auth.h"
+#include "auto_mode.h"
 #include "tusb.h"
 #include "device/usbd_pvt.h"
 #include <string.h>
@@ -146,8 +147,12 @@ static bool control(uint8_t rhport, uint8_t stage, const tusb_control_request_t*
 }
 
 static bool transfer(uint8_t rhport, uint8_t endpoint, xfer_result_t result, uint32_t length) {
-    if (endpoint == input_ep) return true;
+    if (endpoint == input_ep) {
+        if (result == XFER_RESULT_SUCCESS) bb_auto_evidence(BB_AUTO_EVIDENCE_XINPUT_POLL);
+        return true;
+    }
     if (endpoint == output_ep) {
+        if (result == XFER_RESULT_SUCCESS && length) bb_auto_evidence(BB_AUTO_EVIDENCE_XINPUT_OUT);
         if (result == XFER_RESULT_SUCCESS && length >= 8 && output_buffer[0] == 0 && output_buffer[1] == 8)
             bb_bt_host_set_output_rumble(output_buffer[3], output_buffer[4]);
         return usbd_edpt_xfer(rhport, output_ep, output_buffer, sizeof(output_buffer));

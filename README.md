@@ -116,6 +116,7 @@ In this test build, quick presses of BOOTSEL also work:
 | 1 | Start or stop pairing |
 | 2 | Switch to X-Input mode |
 | 3 | Switch to DualSense mode |
+| 4 | Switch to automatic mode |
 
 Holding BOOTSEL for 5 seconds returns to MiSTer mode from any output mode. The LED flashes briefly when the output mode changes.
 
@@ -213,6 +214,12 @@ This is the recommended mode on **macOS**: macOS supports the DualSense natively
 Buttons follow BlueBridge's positional layout: South is Cross, East is Circle, West is Square, North is Triangle, Select is Create, Start is Options and Home is the PS button. The motion sensors report a controller lying still, and the touchpad reports no touches.
 
 Select the mode by its number (`5`) with the management command `BB1|1|OUTPUT_SET|5`. In this test build DualSense replaces Xbox 360 (Console) as mode 5, so management tools that list the Xbox 360 (Console) mode select DualSense instead; Xbox 360 (Console) cannot be selected. BlueBridge also exposes its management interface next to the controller in this mode. To return to MiSTer mode without a management connection, hold **BOOTSEL for 5 seconds** during normal operation.
+
+### Auto (test build)
+
+Detects the host and picks the output mode by itself: BlueBridge first presents itself as an X-Input controller and stays in X-Input if the host loads an Xbox driver (Windows, Linux, MiSTer); otherwise it tries DualSense and stays there if the host reads the DualSense's feature reports (macOS); otherwise it settles on Nintendo Switch mode. Detection takes about one second on Windows and MiSTer, about three on macOS and up to about six on a Switch, during which the adapter may reconnect once or twice. It restarts when the adapter loses its host for five seconds.
+
+Select it with four quick BOOTSEL presses or with the management command `BB1|1|OUTPUT_SET|6`. `STATUS` then reports the mode in use (`effective_output`) and why it was chosen (`auto_detail`). Selecting any other mode turns detection off.
 
 Changing USB output mode is persistent and automatically re-enumerates BlueBridge with the appropriate USB identity.
 

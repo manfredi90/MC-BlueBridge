@@ -1,5 +1,6 @@
 #include "cdc_protocol.h"
 #include "xbox360_auth.h"
+#include "auto_mode.h"
 #include "bluebridge_state.h"
 #include "bluebridge_platform.h"
 #include "usb_device.h"
@@ -73,11 +74,16 @@ static void send_status(const char* id) {
     bb_active_profile_get(&profile);
     uint8_t active_profile = bb_active_profile_index();
     uint8_t output_mode = bb_output_mode_value();
-    char out[1024];
+    char out[1280];
     snprintf(out, sizeof(out), "{\"protocol\":%d,\"firmware\":\"%s\",\"hardware\":\"Pico 2 W\",\"bt_ready\":%s,\"usb_ready\":%s,\"controller_connected\":%s,\"pairing\":%s,\"controller\":\"%s\",\"controller_index\":%d,\"active_profile\":%u,\"profile\":\"%s\",\"output_mode\":%u,\"output\":\"%s\",\"bt_reports\":%lu,\"usb_reports\":%lu,\"dropped_usb_reports\":%lu,\"raw_buttons\":%lu,\"button_capabilities\":%lu,\"battery_supported\":%s,\"battery_percent\":%u,\"battery_state\":%u,\"rumble_supported\":%s,\"capture_mode\":%u,\"xbox360_authenticated\":%s}", BLUEBRIDGE_PROTOCOL_VERSION, BLUEBRIDGE_VERSION, state.bt_ready ? "true" : "false", state.usb_ready ? "true" : "false", state.controller_connected ? "true" : "false", state.pairing ? "true" : "false", state.controller_name, state.controller_index, active_profile, profile.name, output_mode, bb_output_mode_name((bb_output_mode_t)output_mode), (unsigned long)state.bt_reports, (unsigned long)state.usb_reports, (unsigned long)state.dropped_usb_reports, (unsigned long)state.raw_buttons, (unsigned long)state.button_capabilities, state.battery_supported ? "true" : "false", state.battery_percent, state.battery_state, state.rumble_supported ? "true" : "false", state.capture_mode, bb_xbox360_authenticated() ? "true" : "false");
     size_t pos = strlen(out);
     if (pos && out[pos - 1] == '}') {
         snprintf(out + pos - 1, sizeof(out) - pos + 1, ",\"multi_controller\":%s,\"max_connected\":%u,\"slot\":%u,\"turbo_available\":%s,\"macros_available\":%s}", bb_multi_mode() ? "true" : "false", bb_multi_mode() ? BB_MAX_SLOTS : 1, bb_slot_current(), bb_multi_mode() ? "false" : "true", bb_multi_mode() ? "false" : "true");
+        pos = strlen(out);
+        if (output_mode == BB_OUTPUT_AUTO && pos && out[pos - 1] == '}') {
+            bb_output_mode_t effective = bb_output_mode();
+            snprintf(out + pos - 1, sizeof(out) - pos + 1, ",\"effective_output_mode\":%u,\"effective_output\":\"%s\",\"auto_stage\":\"%s\",\"auto_detail\":\"%s\"}", (unsigned)effective, bb_output_mode_name(effective), bb_auto_stage_name(), bb_auto_detail());
+        }
     }
     send_ok(id, out);
 }

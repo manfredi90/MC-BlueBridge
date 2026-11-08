@@ -2,6 +2,7 @@
 #include "bluebridge_state.h"
 #include "xbox360_auth.h"
 #include "dualsense_descriptors.h"
+#include "auto_mode.h"
 #include "pico/unique_id.h"
 #include <string.h>
 
@@ -226,6 +227,7 @@ static const char* string_for_index(uint8_t index) {
 uint16_t const* tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
     (void)langid;
     if (index == 0xee && bb_output_mode() == BB_OUTPUT_XINPUT) {
+        bb_auto_evidence(BB_AUTO_EVIDENCE_WINDOWS);
         static const uint16_t os_string[] = {0x0312, 'M', 'S', 'F', 'T', '1', '0', '0', 0x0020};
         return os_string;
     }

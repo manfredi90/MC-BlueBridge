@@ -35,10 +35,12 @@ typedef enum {
     // 1-5 (MiSTer Companion) can select it. Xbox 360 (Console) is moved out of
     // the valid range and cannot be selected.
     BB_OUTPUT_DUALSENSE = 5,
-    BB_OUTPUT_XBOX360 = 6
+    // Test build: automatic mode, detects the host (X-Input, DualSense or Switch).
+    BB_OUTPUT_AUTO = 6,
+    BB_OUTPUT_XBOX360 = 7
 } bb_output_mode_t;
 
-#define BB_OUTPUT_LAST BB_OUTPUT_DUALSENSE
+#define BB_OUTPUT_LAST BB_OUTPUT_AUTO
 
 typedef struct __attribute__((packed)) {
     int8_t x;
@@ -226,7 +228,12 @@ bool bb_controller_select(uint8_t index);
 uint8_t bb_selected_controller_index(void);
 bool bb_output_mode_set(bb_output_mode_t mode);
 uint16_t bb_current_mister_identity(void);
+// The mode the adapter presents on USB; never BB_OUTPUT_AUTO (in automatic mode
+// it is the mode chosen by the detection). bb_output_mode_value() returns the
+// configured mode, which can be BB_OUTPUT_AUTO.
 bb_output_mode_t bb_output_mode(void);
+void bb_output_auto_set_effective(bb_output_mode_t mode);
+uint32_t bb_output_auto_generation(void);
 const char* bb_output_mode_name(bb_output_mode_t mode);
 uint32_t bb_config_checksum(const bb_config_t* cfg);
 bool bb_config_import(const bb_config_t* cfg, uint32_t checksum);

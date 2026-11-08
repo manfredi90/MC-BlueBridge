@@ -2,6 +2,7 @@
 #include "usb_descriptors.h"
 #include "xinput_device.h"
 #include "dualsense_device.h"
+#include "auto_mode.h"
 #include "xbox360_auth.h"
 #include "hid_feedback.h"
 #include "cdc_protocol.h"
@@ -198,7 +199,9 @@ static void send_pending(void) {
         --q->count;
         send = true;
         queued = true;
-    } else if (mode == BB_OUTPUT_XBOX360) {
+    } else if (mode == BB_OUTPUT_XBOX360 || (mode == BB_OUTPUT_XINPUT && bb_auto_probing_xinput())) {
+        // While probing X-Input, keep a report queued: a host driver polling the
+        // controller completes it, which is the detection signal.
         report = latest_slots[usb_slot];
         send = true;
     } else if (mode == BB_OUTPUT_DUALSENSE && (uint32_t)(to_ms_since_boot(get_absolute_time()) - dualsense_last_send) >= 4u) {
@@ -318,6 +321,7 @@ void bb_usb_core1(void) {
         if (bb_output_mode() == BB_OUTPUT_DUALSENSE) bb_ds5_task();
         bb_usb_service_pending();
         bb_cdc_poll();
+        bb_auto_task();
         handle_reenumeration();
         bb_usb_service_pending();
         bb_config_flush_pending();
@@ -362,6 +366,7 @@ void tud_resume_cb(void) {
 uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t* buffer, uint16_t reqlen) {
     if (bb_output_mode() == BB_OUTPUT_DUALSENSE && !bb_multi_mode()) {
         if (instance != 0 || report_type != HID_REPORT_TYPE_FEATURE) return 0;
+        bb_auto_evidence(BB_AUTO_EVIDENCE_DUALSENSE_FEATURE);
         return bb_ds5_get_feature(report_id, buffer, reqlen);
     }
     if (instance >= (bb_multi_mode() ? BB_MAX_SLOTS : 1) || bb_output_mode() != BB_OUTPUT_MISTER) return 0;

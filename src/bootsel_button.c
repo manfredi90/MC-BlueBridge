@@ -15,6 +15,7 @@
 //   1 short press           start/stop pairing
 //   2 short presses         X-Input output mode
 //   3 short presses         DualSense output mode
+//   4 short presses         automatic output mode (detects the host)
 //   hold 1 s                start/stop pairing
 //   hold 5 s                back to MiSTer mode (from any output mode)
 
@@ -53,7 +54,8 @@ static void toggle_pairing(void) {
 }
 
 static void select_output_mode(bb_output_mode_t mode) {
-    if (bb_output_mode() == mode) return;
+    // Compare with the configured mode, so that a manual choice also leaves Auto.
+    if (bb_output_mode_value() == mode) return;
     if (!bb_output_mode_set(mode)) return;
     bb_led_signal_profile_changed();
     bb_usb_request_reenumeration();
@@ -63,6 +65,10 @@ static void handle_clicks(uint8_t count) {
     if (count == 1) toggle_pairing();
     else if (count == 2) select_output_mode(BB_OUTPUT_XINPUT);
     else if (count == 3) select_output_mode(BB_OUTPUT_DUALSENSE);
+    else if (count == 4) {
+        // Auto is never the presented mode, so always (re)start the detection.
+        if (bb_output_mode_set(BB_OUTPUT_AUTO)) bb_led_signal_profile_changed();
+    }
 }
 
 void bb_bootsel_poll(uint32_t now) {
