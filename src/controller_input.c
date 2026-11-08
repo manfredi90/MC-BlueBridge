@@ -280,7 +280,7 @@ const char* bb_controller_button_label(bb_controller_kind_t kind, const char* na
     else if (kind == BB_CONTROLLER_8BITDO) {
         labels = eightbitdo;
         if (contains_ci(name, "8bitdo 64")) {
-            static const char* labels64[] = {"A","B","C Left","C Right","L","R","ZL","ZR","Select","Start","Stick Click","C Up","Home","Screenshot","C Down"};
+            static const char* labels64[] = {"A","B","Unused","Unused","L","R","ZL","ZR","Select","Start","Stick Click","Unused","Home","Screenshot","Unused"};
             return index < sizeof(labels64) / sizeof(labels64[0]) ? labels64[index] : "Unused";
         }
         if (contains_ci(name, "pro 2")) {
@@ -380,8 +380,8 @@ bb_controller_capabilities_t bb_controller_capabilities(bb_controller_kind_t kin
         case BB_CONTROLLER_8BITDO:
             c.buttons = 0x00003fffu;
             if (contains_ci(name, "8bitdo 64")) {
-                c.buttons = 0x00007fffu;
-                c.right_stick = 0;
+                // Test build: C buttons are reported as the right stick.
+                c.buttons = 0x000037f3u;
             }
             else if (contains_ci(name, "nes30") && !contains_ci(name, "pro") && !contains_ci(name, "arcade")) {
                 c.buttons = 0x0000033fu;

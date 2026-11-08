@@ -1062,16 +1062,16 @@ static bool parse_8bitdo64_d(const uint8_t* report, uint16_t length) {
     s.dpad = hat <= 7 ? hat_to_dpad(hat) : 0;
     s.x = dinput_axis(report[4]);
     s.y = dinput_axis(report[5]);
-    if (report[6] < 64) s.buttons |= 1u << 2;
-    if (report[6] > 191) s.buttons |= 1u << 3;
-    if (report[7] < 64) s.buttons |= 1u << 11;
-    if (report[7] > 191) s.buttons |= 1u << 14;
+    // Test build: the C buttons (Z/Rz axes) are the right stick, as in SDL and
+    // N64 emulators, instead of four digital buttons.
+    s.rx = dinput_axis(report[6]);
+    s.ry = dinput_axis(report[7]);
     s.lt = report[9];
     s.rt = report[8];
     if (s.lt > 8) s.buttons |= 1u << 6;
     if (s.rt > 8) s.buttons |= 1u << 7;
     bb_driver_handle_battery_report(report, length);
-    bb_state_update_button_capabilities(0x00007fffu);
+    bb_state_update_button_capabilities(0x000037f3u);
     submit_state(&s);
     return true;
 }
