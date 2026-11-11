@@ -211,15 +211,15 @@ Presents BlueBridge as a wired DualSense (PlayStation 5) controller.
 
 This is the recommended mode on **macOS**: macOS supports the DualSense natively over USB, so it works with games and apps that use Apple's Game Controller framework as well as with SDL-based apps such as Moonlight, and rumble is supported. It does not work on a PS5 console, which requires controller authentication.
 
-Buttons follow BlueBridge's positional layout: South is Cross, East is Circle, West is Square, North is Triangle, Select is Create, Start is Options and Home is the PS button. The motion sensors report a controller lying still, and the touchpad reports no touches.
+Buttons follow BlueBridge's positional layout: South is Cross, East is Circle, West is Square, North is Triangle, Select is Create, Start is Options, Home is the PS button and Capture is the touchpad button. The motion sensors report a controller lying still, and the touchpad reports no touches.
 
-Select the mode by its number (`5`) with the management command `BB1|1|OUTPUT_SET|5`. In this test build DualSense replaces Xbox 360 (Console) as mode 5, so management tools that list the Xbox 360 (Console) mode select DualSense instead; Xbox 360 (Console) cannot be selected. BlueBridge also exposes its management interface next to the controller in this mode. To return to MiSTer mode without a management connection, hold **BOOTSEL for 5 seconds** during normal operation.
+Select the mode by its number (`6`) with the management command `BB1|1|OUTPUT_SET|6`. BlueBridge also exposes its management interface next to the controller in this mode, under the DualSense USB IDs (054C:0CE6). To return to MiSTer mode without a management connection, hold **BOOTSEL for 5 seconds** during normal operation.
 
 ### Auto (test build)
 
 Detects the host and picks the output mode by itself: BlueBridge first presents itself as an X-Input controller and stays in X-Input if the host loads an Xbox driver (Windows, Linux, MiSTer); otherwise it tries DualSense and stays there if the host reads the DualSense's feature reports (macOS); otherwise it settles on Nintendo Switch mode. Detection takes about one second on Windows and MiSTer, about three on macOS and up to about six on a Switch, during which the adapter may reconnect once or twice. It restarts when the adapter loses its host for five seconds.
 
-Select it with four quick BOOTSEL presses or with the management command `BB1|1|OUTPUT_SET|6`. `STATUS` then reports the mode in use (`effective_output`) and why it was chosen (`auto_detail`). Selecting any other mode turns detection off.
+Select it with four quick BOOTSEL presses or with the management command `BB1|1|OUTPUT_SET|7`. In this mode `STATUS` reports the mode in use as `output_mode`, so MiSTer Companion shows it, plus `auto` (true), `auto_stage` and why the mode was chosen (`auto_detail`). Selecting any other mode, from Companion too, turns detection off.
 
 Changing USB output mode is persistent and automatically re-enumerates BlueBridge with the appropriate USB identity.
 

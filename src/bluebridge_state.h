@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define BLUEBRIDGE_VERSION "1.0.2"
+#define BLUEBRIDGE_VERSION "1.1.0"
 #define BLUEBRIDGE_FIRMWARE_MANIFEST "MCBLUEBRIDGE|" BLUEBRIDGE_VERSION "|PICO2W|SCHEMA=13"
 #define BLUEBRIDGE_PROTOCOL_VERSION 2
 #define BB_CONFIG_SCHEMA 13
@@ -31,13 +31,10 @@ typedef enum {
     BB_OUTPUT_XINPUT = 2,
     BB_OUTPUT_GENERIC_HID = 3,
     BB_OUTPUT_SWITCH = 4,
-    // Test build: DualSense takes number 5 so that tools that only know modes
-    // 1-5 (MiSTer Companion) can select it. Xbox 360 (Console) is moved out of
-    // the valid range and cannot be selected.
-    BB_OUTPUT_DUALSENSE = 5,
+    BB_OUTPUT_XBOX360 = 5,
+    BB_OUTPUT_DUALSENSE = 6,
     // Test build: automatic mode, detects the host (X-Input, DualSense or Switch).
-    BB_OUTPUT_AUTO = 6,
-    BB_OUTPUT_XBOX360 = 7
+    BB_OUTPUT_AUTO = 7
 } bb_output_mode_t;
 
 #define BB_OUTPUT_LAST BB_OUTPUT_AUTO
