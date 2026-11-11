@@ -92,9 +92,6 @@ typedef struct {
     uint16_t hids_cid;
     uint16_t xbox_battery_cid;
     hci_con_handle_t le_handle;
-    uint16_t le_conn_interval;   // units of 1.25 ms, 0 when unknown
-    uint16_t le_conn_latency;
-    uint8_t le_conn_updates;
     bool classic_connecting;
     bool ble_connecting;
     uint32_t ble_attempt_started;
@@ -304,11 +301,6 @@ bool bb_bt_host_diagnostics(char* out, size_t size) {
     return bb_bt_host_diagnostics_slot(bb_slot_current(), out, size);
 }
 
-// Test build: request a 7.5-15 ms BLE connection interval (0 = BTstack's 10-30 ms).
-#ifndef BB_BLE_FAST_INTERVAL
-#define BB_BLE_FAST_INTERVAL 1
-#endif
-
 bool bb_bt_host_diagnostics_slot(uint8_t slot, char* out, size_t size) {
     if (slot >= (bb_multi_mode() ? BB_MAX_SLOTS : 1)) return false;
     const bb_host_context_t* context = &host_slots[slot];
@@ -333,23 +325,11 @@ bool bb_bt_host_diagnostics_slot(uint8_t slot, char* out, size_t size) {
     }
     identity_hex[12] = 0;
     transport_hex[12] = 0;
-    int written = snprintf(out, size, "{\"peer_name_hex\":\"%s\",\"identity_address\":\"%s\",\"transport_address\":\"%s\",\"slot\":%u,\"key_minimum\":%u,\"authentication\":%u,\"pairing_reason\":%d,\"ble_stage\":\"%s\",\"failed_stage\":\"%s\",\"status\":%d,\"attempts\":%lu,\"ble_connecting\":%s,\"le_handle\":%u,\"hid_cid\":%u,\"controller_index\":%d,\"classic_connecting\":%s,\"classic_attempt_active\":%s,\"security_retry\":%s,\"secure_connections_only\":%s,\"le_interval_us\":%lu,\"le_latency\":%u,\"le_updates\":%u,\"le_requested\":\"%s\"}",
+    int written = snprintf(out, size, "{\"peer_name_hex\":\"%s\",\"identity_address\":\"%s\",\"transport_address\":\"%s\",\"slot\":%u,\"key_minimum\":%u,\"authentication\":%u,\"pairing_reason\":%d,\"ble_stage\":\"%s\",\"failed_stage\":\"%s\",\"status\":%d,\"attempts\":%lu,\"ble_connecting\":%s,\"le_handle\":%u,\"hid_cid\":%u,\"controller_index\":%d,\"classic_connecting\":%s,\"classic_attempt_active\":%s,\"security_retry\":%s,\"secure_connections_only\":%s}",
         name_hex, identity_hex, transport_hex, slot, context->ble_key_minimum, context->ble_authentication, context->ble_pairing_reason, context->ble_stage, context->ble_failed_stage, context->ble_setup_status, (unsigned long)context->ble_attempt_count,
         context->ble_connecting ? "true" : "false", context->le_handle, context->hids_cid, context->current_controller_index,
-        context->classic_connecting ? "true" : "false", context->classic_attempt_active ? "true" : "false", context->ble_security_retry ? "true" : "false", context->ble_secure_connections_only ? "true" : "false",
-        (unsigned long)context->le_conn_interval * 1250ul, context->le_conn_latency, context->le_conn_updates,
-        BB_BLE_FAST_INTERVAL ? "7.5-15ms" : "10-30ms");
+        context->classic_connecting ? "true" : "false", context->classic_attempt_active ? "true" : "false", context->ble_security_retry ? "true" : "false", context->ble_secure_connections_only ? "true" : "false");
     return written >= 0 && (size_t)written < size;
-}
-
-static void record_le_connection_update(hci_con_handle_t handle, uint16_t interval, uint16_t latency) {
-    for (int i = 0; i < BB_MAX_SLOTS; ++i) {
-        bb_host_context_t* context = &host_slots[i];
-        if (context->le_handle != handle) continue;
-        context->le_conn_interval = interval;
-        context->le_conn_latency = latency;
-        if (context->le_conn_updates < 255) ++context->le_conn_updates;
-    }
 }
 
 #define classic_attempt_started (host_slots[bb_slot_current()].classic_attempt_started)
@@ -2140,21 +2120,9 @@ static void hci_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pac
                     break;
                 }
                 le_handle = gap_subevent_le_connection_complete_get_connection_handle(packet);
-                host_slots[bb_slot_current()].le_conn_interval = gap_subevent_le_connection_complete_get_conn_interval(packet);
-                host_slots[bb_slot_current()].le_conn_latency = gap_subevent_le_connection_complete_get_conn_latency(packet);
-                host_slots[bb_slot_current()].le_conn_updates = 0;
                 ble_stage = le_custom_nintendo ? "notifications" : "security";
                 if (le_custom_nintendo) enable_nintendo_notifications();
                 else sm_request_pairing(le_handle);
-            }
-            break;
-        case HCI_EVENT_LE_META:
-            // Test build: record the BLE connection interval the controller ends up with.
-            if (hci_event_le_meta_get_subevent_code(packet) == HCI_SUBEVENT_LE_CONNECTION_UPDATE_COMPLETE &&
-                hci_subevent_le_connection_update_complete_get_status(packet) == ERROR_CODE_SUCCESS) {
-                record_le_connection_update(hci_subevent_le_connection_update_complete_get_connection_handle(packet),
-                    hci_subevent_le_connection_update_complete_get_conn_interval(packet),
-                    hci_subevent_le_connection_update_complete_get_conn_latency(packet));
             }
             break;
         case HCI_EVENT_HID_META:
@@ -2458,10 +2426,6 @@ void bb_bt_host_init(void) {
     hid_host_register_packet_handler(hci_handler);
     hci_set_inquiry_mode(INQUIRY_MODE_RSSI_AND_EIR);
     gap_set_default_link_policy_settings(LM_LINK_POLICY_ENABLE_ROLE_SWITCH | LM_LINK_POLICY_ENABLE_SNIFF_MODE);
-    // Test build: open BLE connections at 7.5-15 ms instead of BTstack's 10-30 ms
-    // default. Scan timing, peripheral latency (4) and supervision timeout (720 ms)
-    // keep BTstack's defaults; controllers can still request other parameters.
-    if (BB_BLE_FAST_INTERVAL) gap_set_connection_parameters(0x0060, 0x0030, 0x0006, 0x000c, 4, 0x0048, 0, 0);
     hci_set_master_slave_policy(HCI_ROLE_MASTER);
     gap_set_bondable_mode(1);
     gap_ssp_set_io_capability(SSP_IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
