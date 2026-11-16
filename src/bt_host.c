@@ -1,4 +1,5 @@
 #include "bt_host.h"
+#include "lightbar.h"
 #include <stdio.h>
 #include "bluebridge_state.h"
 #include "controller_driver.h"
@@ -21,6 +22,25 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+#include <math.h>
+
+static uint32_t ds4_lightbar_crc_byte(uint32_t crc,uint8_t byte) {
+    crc^=byte;
+    for(unsigned i=0;i<8;i++)crc=(crc>>1)^((crc&1u)?0xedb88320u:0);
+    return crc;
+}
+void bb_ds4_output_build(uint8_t p[78],uint8_t strength,bb_rgb_t colour,bool low_battery,bool update_blink) {
+    memset(p,0,78);p[0]=0x11;p[1]=0xc4;p[3]=update_blink?0x07:0x03;
+    p[6]=strength;p[7]=strength;p[8]=colour.r;p[9]=colour.g;p[10]=colour.b;
+    /* DS4 hardware timing is in 10 ms units: 1 s on, 1 s off. Sending
+     * zero for both durations restores a solid light. Only update blink timing
+     * when it changes, so repeated rumble reports cannot restart its phase. */
+    p[11]=low_battery?100:0;p[12]=low_battery?100:0;
+    uint32_t crc=ds4_lightbar_crc_byte(0xffffffffu,0xa2);
+    for(unsigned i=0;i<74;i++)crc=ds4_lightbar_crc_byte(crc,p[i]);
+    crc=~crc;
+    for(unsigned i=0;i<4;i++)p[74+i]=(uint8_t)(crc>>(8*i));
+}
 
 #if defined(ENABLE_LE_SECURE_CONNECTIONS) && (BTSTACK_VERSION_MAJOR > 1 || (BTSTACK_VERSION_MAJOR == 1 && (BTSTACK_VERSION_MINOR > 8 || (BTSTACK_VERSION_MINOR == 8 && BTSTACK_VERSION_PATCH >= 2))))
 #define BB_SM_DEFAULT_SC_ONLY true
@@ -131,7 +151,13 @@ typedef struct {
     uint32_t reconnect_block_until;
     volatile bool queued_pending;
     volatile uint8_t queued_strength;
+    volatile uint8_t queued_big;      // separate motors when the source has them (0 = unknown)
+    volatile uint8_t queued_small;
     volatile uint16_t queued_duration;
+    volatile uint8_t led_override;    // DS3 LED override (bits 1..4 = LED1..4), 0 = normal (LED 1)
+    volatile bool led_override_pending;
+    uint8_t motor_big;                // motors of the rumble being played
+    uint8_t motor_small;
     bool rumble_active;
     uint8_t xbox_rumble_payload[8];
     bool xbox_rumble_write_pending;
@@ -142,6 +168,10 @@ typedef struct {
     bool eightbitdo_ble_rumble;
     uint8_t dualsense_output_seq;
     uint8_t ds4_output_report[78];
+    bb_rgb_t ds4_lightbar_sent;
+    bool ds4_lightbar_valid;
+    bool ds4_low_battery,ds4_blink_sent;
+    uint32_t ds4_lightbar_retry_at;
     bool ds4_descriptor_ready;
     bool ds4_activation_pending;
     uint32_t ds4_activation_at;
@@ -153,6 +183,9 @@ typedef struct {
     uint8_t switch_setup_state;
     uint8_t switch_setup_retries;
     uint32_t switch_setup_at;
+    uint8_t snes_led_state;
+    uint8_t snes_led_retries;
+    uint32_t snes_led_at;
     bool manual_disconnect_pending;
     uint32_t manual_disconnect_at;
     uint8_t wiiu_setup_step;
@@ -171,6 +204,7 @@ typedef struct {
     bd_addr_t addr;
     uint8_t page_scan_repetition_mode;
     uint16_t clock_offset;
+    bool controller_peripheral;
 } bb_classic_name_candidate_t;
 static bb_classic_name_candidate_t classic_name_candidates[BB_CLASSIC_NAME_CANDIDATES];
 static uint8_t classic_name_candidate_count;
@@ -402,6 +436,12 @@ bool bb_bt_host_diagnostics_slot(uint8_t slot, char* out, size_t size) {
 #define reconnect_block_until (host_slots[bb_slot_current()].reconnect_block_until)
 #define rumble_request_pending (host_slots[bb_slot_current()].queued_pending)
 #define rumble_request_strength (host_slots[bb_slot_current()].queued_strength)
+#define rumble_request_big (host_slots[bb_slot_current()].queued_big)
+#define rumble_request_small (host_slots[bb_slot_current()].queued_small)
+#define rumble_motor_big (host_slots[bb_slot_current()].motor_big)
+#define ds3_leds (host_slots[bb_slot_current()].led_override)
+#define ds3_leds_pending (host_slots[bb_slot_current()].led_override_pending)
+#define rumble_motor_small (host_slots[bb_slot_current()].motor_small)
 #define rumble_request_duration_ms (host_slots[bb_slot_current()].queued_duration)
 #define rumble_active (host_slots[bb_slot_current()].rumble_active)
 #define xbox_rumble_payload (host_slots[bb_slot_current()].xbox_rumble_payload)
@@ -423,6 +463,9 @@ bool bb_bt_host_diagnostics_slot(uint8_t slot, char* out, size_t size) {
 #define classic_switch_protocol (host_slots[bb_slot_current()].classic_switch_protocol)
 #define switch_setup_state (host_slots[bb_slot_current()].switch_setup_state)
 #define switch_setup_retries (host_slots[bb_slot_current()].switch_setup_retries)
+#define snes_led_state (host_slots[bb_slot_current()].snes_led_state)
+#define snes_led_retries (host_slots[bb_slot_current()].snes_led_retries)
+#define snes_led_at (host_slots[bb_slot_current()].snes_led_at)
 #define switch_setup_at (host_slots[bb_slot_current()].switch_setup_at)
 #define manual_disconnect_pending (host_slots[bb_slot_current()].manual_disconnect_pending)
 #define manual_disconnect_at (host_slots[bb_slot_current()].manual_disconnect_at)
@@ -555,25 +598,83 @@ static bool send_switch_report_mode(uint8_t mode) {
 static bool send_ds4_rumble(uint8_t strength) {
     if (!classic_hid_cid || current_identity.kind != BB_CONTROLLER_DUALSHOCK4 || ds4_activation_step == 2) return false;
     uint8_t* report = ds4_output_report;
-    memset(report, 0, sizeof(ds4_output_report));
-    report[0] = 0x11;
-    report[1] = 0xc4;
-    report[3] = 0x07;
-    report[6] = strength;
-    report[7] = strength;
-    report[10] = 0x40;
-    uint32_t crc = dualsense_output_crc(report, 74);
-    report[74] = (uint8_t)crc;
-    report[75] = (uint8_t)(crc >> 8);
-    report[76] = (uint8_t)(crc >> 16);
-    report[77] = (uint8_t)(crc >> 24);
-    return send_classic_report(classic_hid_cid, 0x11, &report[1], 77) == ERROR_CODE_SUCCESS;
+    bb_rgb_t colour=bb_lightbar_colour((unsigned)current_controller_index,bb_slot_current());
+    bb_runtime_state_t state;bb_state_get(&state);
+    bb_host_context_t* slot=&host_slots[bb_slot_current()];
+    slot->ds4_low_battery=bb_ds4_low_battery_blink(slot->ds4_low_battery,state.battery_supported,state.battery_percent,state.battery_state);
+    bool update_blink=!slot->ds4_lightbar_valid||slot->ds4_blink_sent!=slot->ds4_low_battery;
+    bb_ds4_output_build(report,strength,colour,slot->ds4_low_battery,update_blink);
+    bool sent=send_classic_report(classic_hid_cid, 0x11, &report[1], 77) == ERROR_CODE_SUCCESS;
+    if(sent){slot->ds4_lightbar_sent=colour;slot->ds4_lightbar_valid=true;slot->ds4_blink_sent=slot->ds4_low_battery;}
+    return sent;
+}
+
+static void service_ds4_lightbar(uint32_t now) {
+    if(!classic_hid_cid||current_controller_index<0||current_identity.kind!=BB_CONTROLLER_DUALSHOCK4||
+       ds4_activation_pending||ds4_activation_step==2||manual_disconnect_pending)return;
+    bb_host_context_t* slot=&host_slots[bb_slot_current()];
+    bb_runtime_state_t state;bb_state_get(&state);
+    slot->ds4_low_battery=bb_ds4_low_battery_blink(slot->ds4_low_battery,state.battery_supported,state.battery_percent,state.battery_state);
+    bb_rgb_t colour=bb_lightbar_colour((unsigned)current_controller_index,bb_slot_current());
+    if(slot->ds4_lightbar_valid&&slot->ds4_blink_sent==slot->ds4_low_battery&&!memcmp(&colour,&slot->ds4_lightbar_sent,sizeof(colour)))return;
+    if((int32_t)(now-slot->ds4_lightbar_retry_at)<0)return;
+    slot->ds4_lightbar_retry_at=now+100u;
+    send_ds4_rumble(rumble_active?rumble_active_strength:0);
+}
+
+// Set when the activation feature report is sent; the first SET_REPORT_RESPONSE after it sends the LED report.
+static bool ds3_led_pending;
+
+static bool send_ds3_rumble(uint8_t strength);
+static btstack_timer_source_t ds3_led_timer;
+static uint8_t ds3_led_slot;
+static bool ds3_rumble_retry;
+static uint8_t ds3_led_tries;
+
+static void ds3_led_timer_handler(btstack_timer_source_t* ts) {
+    (void)ts;
+    uint8_t previous = bb_slot_current();
+    bb_slot_enter(ds3_led_slot);   // timers run outside the routed handlers
+    if (!ds3_led_pending || !classic_hid_cid || current_identity.kind != BB_CONTROLLER_DUALSHOCK3) { bb_slot_enter(previous); return; }
+    bool ok = send_ds3_rumble(0);
+    if (ok) ds3_led_pending = false;
+    else if (++ds3_led_tries < 20) {
+        btstack_run_loop_set_timer(&ds3_led_timer, 20);
+        btstack_run_loop_add_timer(&ds3_led_timer);
+    }
+    bb_slot_enter(previous);
+}
+
+static void ds3_led_schedule(void) {
+    ds3_led_slot = bb_slot_current();
+    btstack_run_loop_remove_timer(&ds3_led_timer);
+    btstack_run_loop_set_timer_handler(&ds3_led_timer, ds3_led_timer_handler);
+    btstack_run_loop_set_timer(&ds3_led_timer, 5);
+    btstack_run_loop_add_timer(&ds3_led_timer);
 }
 
 static bool send_ds3_activation(void) {
     if (!classic_hid_cid || current_identity.kind != BB_CONTROLLER_DUALSHOCK3) return false;
+    ds3_led_pending = true;
     uint8_t payload[4] = {0x42, 0x03, 0x00, 0x00};
     return send_classic_set_report(classic_hid_cid, HID_REPORT_TYPE_FEATURE, 0xf4, payload, sizeof(payload)) == ERROR_CODE_SUCCESS;
+}
+
+// Linux turns MiSTer's FF_RUMBLE into one sine magnitude = strong/3 + weak/6 (ff-core compat_effect),
+// so the PSX small motor alone arrives as ~85/255 (~55 seen with MiSTer's gain), the big motor at full
+// as ~170, and the constant faint 1..31 requests are low big-motor levels. 40 keeps those off while
+// passing small-motor effects such as GT2's off-track buzz.
+#define DS3_SMALL_MOTOR_THRESHOLD 40u
+
+// Big-motor gain for the DS3, in percent (CDC RUMBLE_GAIN). PlayStation games drive the big motor
+// with fairly low values (GT2: 1..8 cruising, ~45 half off the track, 120..190 off it), which the
+// DS3 motor renders weaker than the original pad.
+static uint16_t ds3_big_gain = 150;   // 1.5x: chosen by feel in GT2 (2x was slightly too strong)
+void bb_bt_host_set_ds3_big_gain(uint16_t percent) { ds3_big_gain = percent > 1000 ? 1000 : percent; }
+uint16_t bb_bt_host_ds3_big_gain(void) { return ds3_big_gain; }
+static uint8_t ds3_big(uint32_t value) {
+    value = value * ds3_big_gain / 100u;
+    return (uint8_t)(value > 255u ? 255u : value);
 }
 
 static bool send_ds3_rumble(uint8_t strength) {
@@ -581,10 +682,20 @@ static bool send_ds3_rumble(uint8_t strength) {
     uint8_t report[36] = {0};
     report[0] = 0x01;
     report[2] = 0xff;
-    report[3] = strength ? 0x01 : 0x00;
+    // The small (right) motor is on/off only. Driving it for any non-zero strength turned the faint
+    // background requests many games send (most requests were 1..31 of 255) into a constant buzz;
+    // reserve it for clear effects and let the big motor follow the strength.
     report[4] = 0xff;
-    report[5] = strength;
-    report[10] = 0x02;
+    if (strength && (rumble_motor_big || rumble_motor_small)) {
+        // separate motors known (decoded from Linux FF_RUMBLE, or XInput): drive them as asked
+        report[3] = rumble_motor_small ? 0x01 : 0x00;
+        report[5] = ds3_big(rumble_motor_big);
+    } else {
+        // only a merged strength (strong/3 + weak/6): small motor for clear effects, big motor x3
+        report[3] = strength >= DS3_SMALL_MOTOR_THRESHOLD ? 0x01 : 0x00;
+        report[5] = (uint8_t)(strength > 85u ? 255u : strength * 3u);
+    }
+    report[10] = ds3_leds ? (uint8_t)(ds3_leds & 0x1e) : 0x02;   // override 0x01 = all LEDs off
     for (uint8_t i = 0; i < 4; ++i) {
         uint8_t o = (uint8_t)(11u + i * 5u);
         report[o] = 0xff;
@@ -592,7 +703,13 @@ static bool send_ds3_rumble(uint8_t strength) {
         report[o + 2] = 0x10;
         report[o + 4] = 0x32;
     }
-    return send_classic_report(classic_hid_cid, 0x01, &report[1], 35) == ERROR_CODE_SUCCESS;
+    // Over Bluetooth the DS3 only acts on output reports sent as SET_REPORT on the control channel
+    // (as Linux hid-sony does); DATA on the interrupt channel is ignored, so the LEDs kept blinking.
+    uint8_t status = send_classic_set_report(classic_hid_cid, HID_REPORT_TYPE_OUTPUT, 0x01, &report[1], 35);
+    // A SET_REPORT is refused while the previous one awaits its handshake; retry it (else a stop is lost
+    // and the motors keep running, since the DS3 duration byte 0xff means "until told otherwise").
+    ds3_rumble_retry = status == ERROR_CODE_COMMAND_DISALLOWED;
+    return status == ERROR_CODE_SUCCESS;
 }
 
 static bool send_switch_subcommand(uint8_t subcommand, uint8_t value) {
@@ -670,10 +787,45 @@ static void service_switch_setup(uint32_t now) {
     }
 }
 
+// SNES controllers stay in their default report mode (see service_switch_setup), so they
+// never receive the player LED and keep flashing. Send only the player LED subcommand.
+enum { SNES_LED_IDLE = 0, SNES_LED_PENDING, SNES_LED_WAIT_ACK, SNES_LED_DONE };
+
+static void snes_led_begin(uint32_t now) {
+    if (snes_led_state != SNES_LED_IDLE) return;
+    snes_led_state = SNES_LED_PENDING;
+    snes_led_retries = 0;
+    snes_led_at = now + 300u;
+}
+
+static void service_snes_led(uint32_t now) {
+    if (!classic_hid_cid || current_identity.kind != BB_CONTROLLER_NSO_SNES) return;
+    if (snes_led_state != SNES_LED_PENDING && snes_led_state != SNES_LED_WAIT_ACK) return;
+    if ((int32_t)(now - snes_led_at) < 0) return;
+    if (snes_led_state == SNES_LED_WAIT_ACK) {
+        if (snes_led_retries >= 3) {
+            snes_led_state = SNES_LED_DONE;
+            return;
+        }
+        snes_led_retries++;
+        snes_led_state = SNES_LED_PENDING;
+    }
+    if (send_switch_subcommand(0x30, 0x01)) {
+        snes_led_state = SNES_LED_WAIT_ACK;
+        snes_led_at = now + 600u;
+    } else {
+        snes_led_at = now + 200u;
+    }
+}
+
 static void switch_setup_ack(const uint8_t* report, uint16_t len) {
     if (!report || len < 15 || report[0] != 0x21 || !(report[13] & 0x80u)) return;
     uint8_t subcommand = report[14];
     uint32_t now = btstack_run_loop_get_time_ms();
+    if (snes_led_state == SNES_LED_WAIT_ACK && subcommand == 0x30 && current_identity.kind == BB_CONTROLLER_NSO_SNES) {
+        snes_led_state = SNES_LED_DONE;
+        return;
+    }
     if (switch_setup_state == 2 && subcommand == 0x03) {
         switch_setup_state = 3;
         switch_setup_retries = 0;
@@ -755,9 +907,33 @@ static bool send_8bitdo64_ble_rumble(uint8_t strength) {
     return false;
 }
 
+#define XINPUT_RUMBLE_MIN 20u
+#define XINPUT_RUMBLE_FULL 170u
+
 static bool send_8bitdo_dinput_rumble(uint8_t strength) {
     if (eightbitdo64_ble_connected()) return send_8bitdo64_ble_rumble(strength);
     if (!classic_hid_cid || current_identity.kind != BB_CONTROLLER_8BITDO || classic_switch_protocol) return false;
+    if (bb_driver_8bitdo_xinput_mode()) {
+        // X-input mode: Xbox One S style report 3 = enable bits (0 weak, 1 strong motor), magnitudes
+        // 0..100 for left trigger, right trigger, strong, weak, then duration (10 ms units), start
+        // delay and loop count. The D-input report 5 below is ignored in this mode.
+        // These motors run clearly even at low levels, while an original DualShock's big motor only
+        // starts spinning at about 0x50-0x60. Gran Turismo 2 holds the big motor at 0x55 for most of
+        // a race (merged strength ~56), which became a constant buzz with a linear mapping. Map the
+        // merged strength (0..170 for the big motor) on a x^1.5 curve above XINPUT_RUMBLE_MIN:
+        // 56 -> ~12%, 100 -> ~40%, 121 -> ~55%, 170 -> 100%; below the minimum is off.
+        uint8_t magnitude = 0;
+        if (strength >= XINPUT_RUMBLE_MIN) {
+            float x = (float)(strength - XINPUT_RUMBLE_MIN) / (float)(XINPUT_RUMBLE_FULL - XINPUT_RUMBLE_MIN);
+            if (x > 1.0f) x = 1.0f;
+            magnitude = (uint8_t)(x * sqrtf(x) * 100.0f + 0.5f);
+            if (!magnitude) magnitude = 1;
+        }
+        // Always enable both motors and stop with zero magnitudes (as Linux hid-microsoft does):
+        // a report with the enable bits cleared is ignored, so the motors ran on for the duration.
+        uint8_t xinput[8] = {0x03, 0, 0, magnitude, magnitude, 0xff, 0, 0};
+        return send_classic_report(classic_hid_cid, 0x03, xinput, sizeof(xinput)) == ERROR_CODE_SUCCESS;
+    }
     uint8_t payload[4] = {strength, strength, 0, 0};
     return send_classic_report(classic_hid_cid, 0x05, payload, sizeof(payload)) == ERROR_CODE_SUCCESS;
 }
@@ -862,16 +1038,23 @@ static bool send_current_rumble(uint8_t strength) {
 
 static void service_rumble(void) {
     uint32_t now = btstack_run_loop_get_time_ms();
+    if (ds3_leds_pending) {   // LED change (e.g. the analog-hold progress bar): resend with the current motors
+        if (current_identity.kind != BB_CONTROLLER_DUALSHOCK3 || !classic_hid_cid) ds3_leds_pending = false;
+        else if (send_ds3_rumble(rumble_active ? rumble_active_strength : 0)) ds3_leds_pending = false;
+    }
     if (rumble_request_pending) {
         uint8_t strength = rumble_request_strength;
         uint16_t duration = rumble_request_duration_ms;
+        rumble_motor_big = rumble_request_big;
+        rumble_motor_small = rumble_request_small;
         rumble_request_pending = false;
         if (send_current_rumble(strength)) {
             rumble_active = strength != 0;
             rumble_active_strength = strength;
             rumble_stop_at = now + duration;
             rumble_refresh_at = now + 80u;
-        } else if ((xbox_ble_connected() && xbox_rumble_retry) || (eightbitdo64_ble_connected() && eightbitdo64_rumble_retry)) {
+        } else if ((xbox_ble_connected() && xbox_rumble_retry) || (eightbitdo64_ble_connected() && eightbitdo64_rumble_retry) ||
+                   (current_identity.kind == BB_CONTROLLER_DUALSHOCK3 && ds3_rumble_retry)) {
             rumble_request_pending = true;
         }
     }
@@ -882,7 +1065,8 @@ static void service_rumble(void) {
     }
     if (rumble_active && (int32_t)(now - rumble_stop_at) >= 0) {
         bool stopped = send_current_rumble(0);
-        if (!stopped && ((xbox_ble_connected() && xbox_rumble_retry) || (eightbitdo64_ble_connected() && eightbitdo64_rumble_retry))) return;
+        if (!stopped && ((xbox_ble_connected() && xbox_rumble_retry) || (eightbitdo64_ble_connected() && eightbitdo64_rumble_retry) ||
+                         (current_identity.kind == BB_CONTROLLER_DUALSHOCK3 && ds3_rumble_retry))) return;
         rumble_active = false;
         rumble_active_strength = 0;
         rumble_refresh_at = 0;
@@ -960,7 +1144,7 @@ static void reset_classic_name_candidates(void) {
     classic_name_request_active = false;
 }
 
-static void queue_classic_name_candidate(const uint8_t addr[6], uint8_t page_scan_repetition_mode, uint16_t clock_offset) {
+static void queue_classic_name_candidate(const uint8_t addr[6], uint8_t page_scan_repetition_mode, uint16_t clock_offset, bool controller_peripheral) {
     for (uint8_t i = 0; i < classic_name_candidate_count; ++i) {
         if (same_address(classic_name_candidates[i].addr, addr)) return;
     }
@@ -969,6 +1153,7 @@ static void queue_classic_name_candidate(const uint8_t addr[6], uint8_t page_sca
     memcpy(candidate->addr, addr, 6);
     candidate->page_scan_repetition_mode = page_scan_repetition_mode;
     candidate->clock_offset = clock_offset;
+    candidate->controller_peripheral = controller_peripheral;
 }
 
 static void request_next_classic_name(void) {
@@ -1183,7 +1368,9 @@ static void activate_controller(const uint8_t addr[6], uint8_t address_type, uin
         classic_switch_protocol = true;
         switch_setup_begin();
     }
-    if (current_identity.kind == BB_CONTROLLER_DUALSHOCK3) { send_ds3_activation(); send_ds3_rumble(0); }
+    // The LED/rumble report follows on HID_SUBEVENT_SET_REPORT_RESPONSE: sending it while the activation
+    // SET_REPORT is in flight overwrites hid_host's pending request, so the LEDs kept blinking.
+    if (current_identity.kind == BB_CONTROLLER_DUALSHOCK3) send_ds3_activation();
     ds4_descriptor_ready = false;
     if (current_identity.kind == BB_CONTROLLER_DUALSHOCK4) {
         ds4_activation_pending = true;
@@ -1249,6 +1436,10 @@ static void controller_disconnected(bool link_closed) {
     ds4_descriptor_ready = false;
     ds4_activation_pending = false;
     ds4_activation_step = 0;
+    host_slots[bb_slot_current()].ds4_lightbar_valid=false;
+    host_slots[bb_slot_current()].ds4_low_battery=false;
+    host_slots[bb_slot_current()].ds4_blink_sent=false;
+    host_slots[bb_slot_current()].ds4_lightbar_retry_at=0;
     arcade_battery_poll_at = 0;
     identity_query_pending = false;
     connected_name_request = false;
@@ -1296,6 +1487,9 @@ static void controller_disconnected(bool link_closed) {
     switch_setup_state = 0;
     switch_setup_retries = 0;
     switch_setup_at = 0;
+    snes_led_state = SNES_LED_IDLE;
+    snes_led_retries = 0;
+    snes_led_at = 0;
     manual_disconnect_pending = false;
     manual_disconnect_at = 0;
     wiiu_setup_step = 0;
@@ -1781,43 +1975,127 @@ static void sm_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pack
     }
 }
 
+// The HID L2CAP services are registered at security level 0 (see bb_bt_host_init) so that controllers
+// without Secure Simple Pairing, such as the DualShock 3, can connect: they never answer an
+// authentication request, so a level 2 service drops them after the pairing timeout.
+// Controllers with SSP are still authenticated (level 2) before their incoming connection is
+// accepted, as before. This mirrors BlueZ, which listens at low security and raises it per device.
+// At level 0 L2CAP reports the incoming channel before the remote features are read, so the
+// decision waits for them (SECURE_WAIT_FEATURES), then authenticates SSP controllers (SECURE_WAIT_AUTH).
+enum { SECURE_WAIT_NONE, SECURE_WAIT_FEATURES, SECURE_WAIT_AUTH };
+static uint8_t secure_wait_state = SECURE_WAIT_NONE;
+static uint16_t secure_wait_cid;
+static hci_con_handle_t secure_wait_handle = HCI_CON_HANDLE_INVALID;
+static bd_addr_t secure_wait_addr;
+static uint8_t secure_wait_slot;   // multi mode: the per-slot state the incoming connection belongs to
+
+static bool incoming_needs_authentication(hci_con_handle_t handle) {
+    if (gap_security_level(handle) >= LEVEL_2) return false;
+    return gap_ssp_supported_on_both_sides(handle);
+}
+
+static void incoming_hid_connection(uint16_t incoming_cid, const uint8_t addr_in[6], hci_con_handle_t handle, bool secured) {
+    bd_addr_t addr;
+    memcpy(addr, addr_in, sizeof(addr));
+    if (closing_handle != HCI_CON_HANDLE_INVALID || reconnect_blocked(addr) || (!pairing && !remembered_address(addr))) {
+        hid_host_decline_connection(incoming_cid);
+        return;
+    }
+    bb_runtime_state_t state;
+    bb_state_get(&state);
+    if (state.controller_connected) {
+        hid_host_decline_connection(incoming_cid);
+        return;
+    }
+    if (ble_connecting) {
+        hid_host_decline_connection(incoming_cid);
+        return;
+    }
+    if (classic_connecting && memcmp(pending_addr, addr, sizeof(pending_addr)) != 0) {
+        hid_host_decline_connection(incoming_cid);
+        return;
+    }
+    if (!secured && (!hci_remote_features_available(handle) || incoming_needs_authentication(handle))) {
+        if (secure_wait_handle != HCI_CON_HANDLE_INVALID && secure_wait_handle != handle) {
+            hid_host_decline_connection(incoming_cid);
+            return;
+        }
+        secure_wait_cid = incoming_cid;
+        secure_wait_handle = handle;
+        secure_wait_slot = bb_slot_current();
+        memcpy(secure_wait_addr, addr, sizeof(secure_wait_addr));
+        if (!hci_remote_features_available(handle)) {
+            secure_wait_state = SECURE_WAIT_FEATURES;
+            hci_remote_features_query(handle);
+            return;
+        }
+        secure_wait_state = SECURE_WAIT_AUTH;
+        gap_request_security_level(handle, LEVEL_2);
+        return;
+    }
+    uint16_t previous_cid = classic_hid_cid;
+    classic_hid_cid = incoming_cid;
+    classic_connecting = true;
+    classic_attempt_active = true;
+    classic_attempt_started = btstack_run_loop_get_time_ms();
+    stop_scans();
+    memcpy(pending_addr, addr, sizeof(pending_addr));
+    const char* known_name = remembered_name(addr);
+    if (known_name && known_name[0]) copy_name(pending_name, sizeof(pending_name), known_name);
+    else pending_name[0] = 0;
+    if (previous_cid && previous_cid != incoming_cid) hid_host_disconnect(previous_cid);
+    hid_host_accept_connection(incoming_cid, HID_PROTOCOL_MODE_REPORT);
+}
+
+// Called for every HCI event: resumes an incoming connection once its remote features are known.
+static void secure_wait_check_features(void) {
+    if (secure_wait_state != SECURE_WAIT_FEATURES || !hci_remote_features_available(secure_wait_handle)) return;
+    uint16_t cid = secure_wait_cid;
+    hci_con_handle_t handle = secure_wait_handle;
+    bd_addr_t addr;
+    memcpy(addr, secure_wait_addr, sizeof(addr));
+    secure_wait_state = SECURE_WAIT_NONE;
+    secure_wait_handle = HCI_CON_HANDLE_INVALID;
+    secure_wait_cid = 0;
+    // resumed from whatever event came next: switch to the slot the connection was routed to
+    uint8_t previous = bb_slot_current();
+    bb_slot_enter(secure_wait_slot);
+    incoming_hid_connection(cid, addr, handle, false);
+    bb_slot_enter(previous);
+}
+
+static void secure_wait_security_level(const uint8_t* packet) {
+    hci_con_handle_t handle = gap_event_security_level_get_handle(packet);
+    if (secure_wait_state != SECURE_WAIT_AUTH || handle != secure_wait_handle) return;
+    uint16_t cid = secure_wait_cid;
+    bd_addr_t addr;
+    memcpy(addr, secure_wait_addr, sizeof(addr));
+    secure_wait_state = SECURE_WAIT_NONE;
+    secure_wait_handle = HCI_CON_HANDLE_INVALID;
+    secure_wait_cid = 0;
+    gap_security_level_t level = (gap_security_level_t)gap_event_security_level_get_security_level(packet);
+    uint8_t previous = bb_slot_current();
+    bb_slot_enter(secure_wait_slot);
+    if (level >= LEVEL_2) incoming_hid_connection(cid, addr, handle, true);
+    else hid_host_decline_connection(cid);
+    bb_slot_enter(previous);
+}
+
+static void secure_wait_disconnected(hci_con_handle_t handle) {
+    if (handle != secure_wait_handle) return;
+    secure_wait_state = SECURE_WAIT_NONE;
+    secure_wait_handle = HCI_CON_HANDLE_INVALID;
+    secure_wait_cid = 0;
+}
+
 static void classic_hid_event(uint8_t* packet) {
     switch (hci_event_hid_meta_get_subevent_code(packet)) {
         case HID_SUBEVENT_INCOMING_CONNECTION: {
             if (hid_subevent_incoming_connection_get_status(packet) != ERROR_CODE_SUCCESS) break;
             bd_addr_t addr;
-            uint16_t incoming_cid = hid_subevent_incoming_connection_get_hid_cid(packet);
             hid_subevent_incoming_connection_get_address(packet, addr);
-            if (closing_handle != HCI_CON_HANDLE_INVALID || reconnect_blocked(addr) || (!pairing && !remembered_address(addr))) {
-                hid_host_decline_connection(incoming_cid);
-                break;
-            }
-            bb_runtime_state_t state;
-            bb_state_get(&state);
-            if (state.controller_connected) {
-                hid_host_decline_connection(incoming_cid);
-                break;
-            }
-            if (ble_connecting) {
-                hid_host_decline_connection(incoming_cid);
-                break;
-            }
-            if (classic_connecting && memcmp(pending_addr, addr, sizeof(pending_addr)) != 0) {
-                hid_host_decline_connection(incoming_cid);
-                break;
-            }
-            uint16_t previous_cid = classic_hid_cid;
-            classic_hid_cid = incoming_cid;
-            classic_connecting = true;
-            classic_attempt_active = true;
-            classic_attempt_started = btstack_run_loop_get_time_ms();
-            stop_scans();
-            memcpy(pending_addr, addr, sizeof(pending_addr));
-            const char* known_name = remembered_name(addr);
-            if (known_name && known_name[0]) copy_name(pending_name, sizeof(pending_name), known_name);
-            else pending_name[0] = 0;
-            if (previous_cid && previous_cid != incoming_cid) hid_host_disconnect(previous_cid);
-            hid_host_accept_connection(incoming_cid, HID_PROTOCOL_MODE_REPORT);
+            incoming_hid_connection(hid_subevent_incoming_connection_get_hid_cid(packet), addr,
+                                    hid_subevent_incoming_connection_get_handle(packet), false);
             break;
         }
         case HID_SUBEVENT_CONNECTION_OPENED: {
@@ -1901,6 +2179,15 @@ static void classic_hid_event(uint8_t* packet) {
                 if (current_identity.kind == BB_CONTROLLER_8BITDO && name_has(current_identity.name, "pro 3")) hid_host_send_get_report(classic_hid_cid, HID_REPORT_TYPE_FEATURE, 0x06);
             }
             break;
+        case HID_SUBEVENT_SET_REPORT_RESPONSE:
+            // DS3: activation acknowledged, now set the player LED (and stop the blinking)
+            // hid_host only returns to ESTABLISHED after this event, so send from a timer.
+            if (current_identity.kind == BB_CONTROLLER_DUALSHOCK3 && ds3_led_pending &&
+                hid_subevent_set_report_response_get_hid_cid(packet) == classic_hid_cid) {
+                ds3_led_tries = 0;
+                ds3_led_schedule();
+            }
+            break;
         case HID_SUBEVENT_GET_REPORT_RESPONSE: {
             if (hid_subevent_get_report_response_get_hid_cid(packet) == classic_hid_cid &&
                 current_identity.kind == BB_CONTROLLER_DUALSHOCK4 && ds4_activation_step == 2) {
@@ -1939,6 +2226,7 @@ static void classic_hid_event(uint8_t* packet) {
                     classic_switch_protocol = true;
                     if (switch_setup_state == 0 && !classic_switch_setup_sent) switch_setup_begin();
                 }
+                if (current_identity.kind == BB_CONTROLLER_NSO_SNES) snes_led_begin(btstack_run_loop_get_time_ms());
             }
             last_controller_report_at = btstack_run_loop_get_time_ms();
             bb_driver_handle_hid_report(report, len);
@@ -1970,9 +2258,20 @@ static void hci_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pac
     (void)size;
     if (packet_type != HCI_EVENT_PACKET) return;
     uint8_t event = hci_event_packet_get_type(packet);
+    secure_wait_check_features();
     switch (event) {
+        case GAP_EVENT_SECURITY_LEVEL:
+            secure_wait_security_level(packet);
+            break;
         case BTSTACK_EVENT_STATE:
             if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
+                // Listen for reconnecting controllers often enough that pages are heard while
+                // another controller is connected and LE scanning shares the radio: 11.25 ms
+                // every 160 ms, interlaced (BlueZ fast connectable). The controller default is
+                // 11.25 ms every 1.28 s, standard. Set here because power-on resets BTstack's
+                // pending GAP tasks.
+                gap_set_page_scan_activity(0x0100, 0x0012);
+                gap_set_page_scan_type(PAGE_SCAN_MODE_INTERLACED);
                 stack_ready = true;
                 bb_state_set_bt_ready(true);
                 start_scans();
@@ -2023,10 +2322,11 @@ static void hci_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pac
             bool keyboard_or_pointing = peripheral && (cod & 0xc0u);
             bool controller_peripheral = peripheral && !keyboard_or_pointing && (minor == 0x00u || minor == 0x04u || minor == 0x08u);
             bool remembered = remembered_address(addr);
-            if (pairing && (remembered || controller_peripheral || likely_controller_name(name))) {
+            if (pairing && !remembered && !name[0]) {
+                // Resolve the name before authentication so legacy Wii U Pro pairing can select its PIN.
+                queue_classic_name_candidate(addr, gap_event_inquiry_result_get_page_scan_repetition_mode(packet), gap_event_inquiry_result_get_clock_offset(packet), controller_peripheral);
+            } else if (pairing && (remembered || controller_peripheral || likely_controller_name(name))) {
                 if (accept_candidate(addr, name, controller_peripheral || remembered)) connect_classic(addr, name);
-            } else if (pairing && !name[0]) {
-                queue_classic_name_candidate(addr, gap_event_inquiry_result_get_page_scan_repetition_mode(packet), gap_event_inquiry_result_get_clock_offset(packet));
             }
             break;
         }
@@ -2053,6 +2353,7 @@ static void hci_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pac
             if (!classic_name_request_active) break;
             bd_addr_t addr;
             reverse_bd_addr(&packet[3], addr);
+            if (!same_address(addr, classic_name_candidates[classic_name_candidate_index].addr)) break;
             char name[32] = {0};
             if (packet[2] == ERROR_CODE_SUCCESS) {
                 size_t n = 0;
@@ -2062,7 +2363,8 @@ static void hci_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pac
                 name[n] = 0;
             }
             classic_name_request_active = false;
-            if (packet[2] == ERROR_CODE_SUCCESS && likely_controller_name(name) && accept_candidate(addr, name, false)) {
+            bool controller_peripheral = classic_name_candidates[classic_name_candidate_index].controller_peripheral;
+            if ((controller_peripheral || likely_controller_name(name)) && accept_candidate(addr, name, controller_peripheral)) {
                 connect_classic(addr, name);
                 break;
             }
@@ -2138,11 +2440,26 @@ static void hci_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pac
         case HCI_EVENT_PIN_CODE_REQUEST: {
             bd_addr_t addr;
             hci_event_pin_code_request_get_bd_addr(packet, addr);
-            if (pairing || remembered_address(addr)) gap_pin_code_response(addr, "0000");
-            else gap_pin_code_negative(addr);
+            if (!pairing && !remembered_address(addr)) {
+                gap_pin_code_negative(addr);
+                break;
+            }
+            const char* known_name = remembered_name(addr);
+            bool wiiu_pro = (same_address(addr, pending_addr) && name_has(pending_name, "rvl-cnt-01-uc")) ||
+                            name_has(known_name, "rvl-cnt-01-uc");
+            if (wiiu_pro) {
+                // SYNC-button pairing uses the host address as a six-byte binary PIN.
+                bd_addr_t local_addr, pin;
+                gap_local_bd_addr(local_addr);
+                reverse_bd_addr(local_addr, pin);
+                gap_pin_code_response_binary(addr, pin, sizeof(pin));
+            } else {
+                gap_pin_code_response(addr, "0000");
+            }
             break;
         }
         case HCI_EVENT_DISCONNECTION_COMPLETE: {
+            secure_wait_disconnected(hci_event_disconnection_complete_get_connection_handle(packet));
             hci_con_handle_t handle = hci_event_disconnection_complete_get_connection_handle(packet);
             if (release_closing_handle(handle)) {
                 start_scans();
@@ -2309,6 +2626,7 @@ static void service_slot(void) {
     }
     service_classic_identity();
     service_switch_setup(now);
+    service_snes_led(now);
     bb_runtime_state_t live_state;
     bb_state_get(&live_state);
     bool nintendo_stream = current_identity.kind == BB_CONTROLLER_NSO_N64 || current_identity.kind == BB_CONTROLLER_SWITCH_PRO || current_identity.kind == BB_CONTROLLER_JOYCON_LEFT || current_identity.kind == BB_CONTROLLER_JOYCON_RIGHT || current_identity.kind == BB_CONTROLLER_SWITCH2_PRO || current_identity.kind == BB_CONTROLLER_NSO_GAMECUBE;
@@ -2324,6 +2642,7 @@ static void service_slot(void) {
         else if (classic_handle != HCI_CON_HANDLE_INVALID) gap_disconnect(classic_handle);
     }
     service_rumble();
+    service_ds4_lightbar(now);
 }
 static void usb_watch_handler(btstack_timer_source_t* timer) {
     uint8_t previous = bb_slot_current();
@@ -2422,7 +2741,11 @@ void bb_bt_host_init(void) {
     device_information_service_client_init();
     battery_service_client_init();
     hids_host_init(hids_descriptor_storage, sizeof(hids_descriptor_storage));
+    // HID services at level 0; SSP controllers are authenticated per connection (incoming_hid_connection).
+    // Outgoing channels still use the global level 2, restored straight after.
+    gap_set_security_level(LEVEL_0);
     hid_host_init(classic_hid_storage, sizeof(classic_hid_storage));
+    gap_set_security_level(LEVEL_2);
     hid_host_register_packet_handler(hci_handler);
     hci_set_inquiry_mode(INQUIRY_MODE_RSSI_AND_EIR);
     gap_set_default_link_policy_settings(LM_LINK_POLICY_ENABLE_ROLE_SWITCH | LM_LINK_POLICY_ENABLE_SNIFF_MODE);
@@ -2566,6 +2889,7 @@ bool bb_bt_host_rumble_test(uint8_t strength, uint16_t duration_ms) {
     if (!state.rumble_supported) return false;
     if (duration_ms < 50) duration_ms = 50;
     if (duration_ms > 3000) duration_ms = 3000;
+    rumble_request_big = rumble_request_small = 0;
     rumble_request_strength = strength;
     rumble_request_duration_ms = duration_ms;
     rumble_request_pending = true;
@@ -2575,8 +2899,42 @@ bool bb_bt_host_rumble_test(uint8_t strength, uint16_t duration_ms) {
 void bb_bt_host_set_output_rumble(uint8_t left, uint8_t right) {
     uint8_t strength = left > right ? left : right;
     rumble_request_strength = strength;
+    rumble_request_big = left;
+    rumble_request_small = right;
     rumble_request_duration_ms = strength ? 1200u : 50u;
     rumble_request_pending = true;
+}
+
+// strength drives single-strength controllers (unchanged behaviour); big/small drive controllers
+// with separate motors (DualShock 3).
+void bb_bt_host_set_slot_rumble_motors(uint8_t slot, uint8_t strength, uint8_t big, uint8_t small) {
+    if (slot >= BB_MAX_SLOTS) return;
+    bb_host_context_t* context = &host_slots[slot];
+    context->queued_strength = strength;
+    context->queued_big = big;
+    context->queued_small = small;
+    context->queued_duration = strength ? 1200u : 50u;
+    context->queued_pending = true;
+}
+
+// The adapter's own Bluetooth address ("" until the stack is up). A DualShock 3 pairs by having
+// this address written into it over USB (sixpair / SixaxisPairTool), so tools need to read it.
+void bb_bt_host_local_address(char* out, size_t size) {
+    if (!out || !size) return;
+    out[0] = 0;
+    if (!stack_ready) return;
+    bd_addr_t addr;
+    gap_local_bd_addr(addr);
+    snprintf(out, size, "%s", bd_addr_to_str(addr));
+}
+
+// LED override for a DualShock 3 (bits 1..4 = LED1..4, 0x01 = all off); 0 restores the normal LED.
+// Other pads ignore it.
+void bb_bt_host_set_slot_ds3_leds(uint8_t slot, uint8_t leds) {
+    if (slot >= BB_MAX_SLOTS) return;
+    if (host_slots[slot].led_override == leds) return;
+    host_slots[slot].led_override = leds;
+    host_slots[slot].led_override_pending = true;
 }
 
 void bb_bt_host_set_slot_rumble(uint8_t slot, uint8_t left, uint8_t right) {
@@ -2584,6 +2942,8 @@ void bb_bt_host_set_slot_rumble(uint8_t slot, uint8_t left, uint8_t right) {
     uint8_t strength = left > right ? left : right;
     bb_host_context_t* context = &host_slots[slot];
     context->queued_strength = strength;
+    context->queued_big = left;
+    context->queued_small = right;
     context->queued_duration = strength ? 1200u : 50u;
     context->queued_pending = true;
 }

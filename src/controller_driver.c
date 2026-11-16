@@ -1,9 +1,111 @@
 #include "controller_driver.h"
 #include "bluebridge_state.h"
 #include "usb_device.h"
+#include "bt_host.h"
 #include "btstack.h"
+#include "pico/stdlib.h"
+#include "ds4_gyro.h"
 #include <string.h>
 #include <stdio.h>
+
+static uint32_t ds4_pointer_crc_byte(uint32_t crc,uint8_t byte) {
+    crc^=byte;
+    for(unsigned i=0;i<8;i++)crc=(crc>>1)^((crc&1u)?0xedb88320u:0);
+    return crc;
+}
+bool bb_ds4_pointer_decode(bb_ds4_pointer_t* s,const uint8_t* p,uint16_t len,
+                           uint32_t now,bb_pointer_sample_t* out) {
+    if(!p||len!=78||p[0]!=0x11||p[35]>4)return false;
+    uint32_t crc=ds4_pointer_crc_byte(0xffffffffu,0xa1);
+    for(unsigned i=0;i<74;i++)crc=ds4_pointer_crc_byte(crc,p[i]);
+    uint32_t received=(uint32_t)p[74]|((uint32_t)p[75]<<8)|((uint32_t)p[76]<<16)|((uint32_t)p[77]<<24);
+    if((~crc)!=received)return false;
+    *out=(bb_pointer_sample_t){.buttons=(p[9]&2u)?1:0};
+    if((uint32_t)(now-s->at)>500u)memset(s,0,sizeof(*s));
+    s->at=now;
+    for(unsigned i=0;i<p[35];i++) {
+        const uint8_t* record=p+36+9*i;
+        uint8_t timestamp=record[0];
+        if(s->have_timestamp && (int8_t)(timestamp-s->timestamp)<=0)continue;
+        s->have_timestamp=true;s->timestamp=timestamp;
+        const uint8_t* point=record+1;
+        if(point[0]&0x80u)point+=4;
+        int16_t x=(int16_t)(point[1]|((point[2]&15u)<<8));
+        int16_t y=(int16_t)((point[2]>>4)|(point[3]<<4));
+        uint8_t id=point[0]&0x7fu;
+        if((point[0]&0x80u)||x>=1920||y>=942) {
+            s->touching=false;s->remainder_x=s->remainder_y=0;continue;
+        }
+        int dx=x-s->x,dy=y-s->y;
+        if(s->touching && id==s->contact && dx>=-512&&dx<=512&&dy>=-512&&dy<=512) {
+            int rx=dx+s->remainder_x,ry=dy+s->remainder_y;
+            out->x+=(int16_t)(rx/4);out->y+=(int16_t)(ry/4);
+            s->remainder_x=(int16_t)(rx%4);s->remainder_y=(int16_t)(ry%4);
+        } else s->remainder_x=s->remainder_y=0;
+        s->touching=true;s->contact=id;s->x=x;s->y=y;
+    }
+    return true;
+}
+
+static int16_t ds4_gyro_s16(const uint8_t* p) {
+    uint16_t v=(uint16_t)(p[0]|((uint16_t)p[1]<<8));
+    return (int16_t)(v<=32767u?(int32_t)v:(int32_t)v-65536);
+}
+static int32_t ds4_gyro_abs32(int32_t v){return v<0?-v:v;}
+static int16_t ds4_gyro_bounded(int32_t v){return (int16_t)(v>32767?32767:v< -32767?-32767:v);}
+
+void bb_ds4_gyro_apply(bb_ds4_gyro_t* s,const uint8_t* p,uint32_t now,
+    bb_ds4_aim_t aim,bool touching,bb_input_state_t* input,bb_pointer_sample_t* pointer) {
+    if(!aim.enabled||!bb_ds4_aim_valid(aim)){memset(s,0,sizeof(*s));return;}
+    bool paused=aim.pause_button<32 && (input->buttons&(1u<<aim.pause_button));
+    if(aim.pause_button<32)input->buttons&=~(1u<<aim.pause_button);
+    if(paused && aim.pause_button==13)pointer->buttons&=~1u;
+    bool active=!paused && (aim.activation==0 || (aim.activation==1&&touching) ||
+        (aim.activation==2&&(input->lt>=128 || (input->buttons&(1u<<6)))));
+    if(aim.flags&BB_AIM_TRIGGER_FIRE) {
+        if(!paused && (input->rt>=128 || (input->buttons&(1u<<7))))pointer->buttons|=1;
+        input->rt=0;input->buttons&=~(1u<<7);
+    }
+    uint16_t timestamp=(uint16_t)(p[12]|((uint16_t)p[13]<<8));
+    uint32_t dt=now-s->at;
+    if(!active){s->active=false;s->remainder_x=s->remainder_y=0;}
+    bool gap=!s->have_timestamp || dt>50u;
+    if(s->have_timestamp && !gap && (int16_t)(timestamp-s->timestamp)<=0)return;
+    s->have_timestamp=true;s->timestamp=timestamp;s->at=now;
+    int32_t pitch=ds4_gyro_s16(p+15),yaw=ds4_gyro_s16(p+17);
+    /* Hold the selected pause button with the controller still for >=0.5s
+     * and >=32 fresh samples to estimate resting bias. Movement/gaps restart
+     * collection. This deliberately never adapts bias during active aiming. */
+    if(paused) {
+        if(gap || !s->collecting || ds4_gyro_abs32(pitch-s->first_y)>16 || ds4_gyro_abs32(yaw-s->first_x)>16) {
+            s->collecting=true;s->zero_at=now;s->zero_samples=0;
+            s->zero_x=s->zero_y=0;s->first_x=(int16_t)yaw;s->first_y=(int16_t)pitch;
+        }
+        if(s->zero_samples<1024) {
+            s->zero_x+=yaw;s->zero_y+=pitch;++s->zero_samples;
+            if(s->zero_samples>=32 && (uint32_t)(now-s->zero_at)>=500u) {
+                s->bias_x=(int16_t)(s->zero_x/s->zero_samples);
+                s->bias_y=(int16_t)(s->zero_y/s->zero_samples);
+            }
+        }
+    } else s->collecting=false;
+    if(active && s->active && !gap && dt) {
+        yaw-=s->bias_x;pitch-=s->bias_y;
+        if(ds4_gyro_abs32(yaw)<=8)yaw=0;
+        if(ds4_gyro_abs32(pitch)<=8)pitch=0;
+        if(aim.flags&BB_AIM_INVERT_X)yaw=-yaw;
+        if(aim.flags&BB_AIM_INVERT_Y)pitch=-pitch;
+        /* Nominal DS4 scale: 16.4 raw units/degree/s. At 100% use
+         * 10 mouse counts/degree, retaining sub-count motion. Use int64
+         * because bias subtraction can span the full signed sensor range. */
+        int64_t x=(int64_t)yaw*dt*aim.sensitivity+s->remainder_x;
+        int64_t y=-(int64_t)pitch*dt*aim.sensitivity+s->remainder_y;
+        pointer->x=ds4_gyro_bounded((int32_t)pointer->x+(int32_t)(x/164000));
+        pointer->y=ds4_gyro_bounded((int32_t)pointer->y+(int32_t)(y/164000));
+        s->remainder_x=(int32_t)(x%164000);s->remainder_y=(int32_t)(y%164000);
+    } else s->remainder_x=s->remainder_y=0;
+    s->active=active;
+}
 
 #define BB_DPAD_UP 1
 #define BB_DPAD_DOWN 2
@@ -22,6 +124,8 @@
 #define HID_USAGE_BATTERY_STRENGTH 0x20
 
 typedef struct {
+    bb_ds4_pointer_t pointer;
+    bb_ds4_gyro_t ds4_gyro;
     uint8_t early_arcade_battery_report[2];
     bool have_early_arcade_battery_report;
     int16_t diagnostic_battery_request_status;
@@ -37,6 +141,7 @@ typedef struct {
     uint8_t descriptor_storage[8192];
     const uint8_t* hid_descriptor;
     uint16_t hid_descriptor_len;
+    int8_t descriptor_menu_button;   // -1 = not checked yet for this descriptor
     bb_input_state_t last_input_state;
     bool have_last_input_state;
     bool pro2_home_pressed;
@@ -68,6 +173,7 @@ static bb_driver_context_t driver_slots[BB_MAX_SLOTS] = {
 #define identity (driver_slots[bb_slot_current()].identity)
 #define hid_descriptor (driver_slots[bb_slot_current()].hid_descriptor)
 #define hid_descriptor_len (driver_slots[bb_slot_current()].hid_descriptor_len)
+#define descriptor_menu_button (driver_slots[bb_slot_current()].descriptor_menu_button)
 #define last_input_state (driver_slots[bb_slot_current()].last_input_state)
 #define have_last_input_state (driver_slots[bb_slot_current()].have_last_input_state)
 #define pro2_home_pressed (driver_slots[bb_slot_current()].pro2_home_pressed)
@@ -80,6 +186,209 @@ static bb_driver_context_t driver_slots[BB_MAX_SLOTS] = {
 #define n64_center (driver_slots[bb_slot_current()].n64_center)
 #define n64_below (driver_slots[bb_slot_current()].n64_below)
 #define n64_above (driver_slots[bb_slot_current()].n64_above)
+
+// ---- Select+Start -> Home (menu) chord ---------------------------------------------------------
+// MiSTer accepts one menu trigger per mapping, and in multi-controller mode every pad shares one
+// mapping. So pads without a Home button get one: hold Select+Start for MENU_CHORD_MS and BlueBridge
+// sends Home instead (MiSTer Menu = Home then works on every pad). Select/Start are held back while
+// the chord is pending; a shorter press is passed on as Select+Start (briefly) so in-game combos such
+// as soft reset still work. Pads that report a Home button are left alone.
+#define BTN_SELECT (1u << 8)
+#define BTN_START (1u << 9)
+#define BTN_HOME (1u << 12)
+#define MENU_CHORD_MS 600u
+#define MENU_CHORD_TAP_MS 60u
+#define MENU_CHORD_HOME_TAP_MS 100u
+enum { CHORD_IDLE, CHORD_PENDING, CHORD_ACTIVE, CHORD_RELEASING, CHORD_TAP };
+typedef struct {
+    uint8_t state;
+    uint32_t started;
+    bb_input_state_t raw;
+    bool have_raw;
+    btstack_timer_source_t timer;
+} menu_chord_t;
+static menu_chord_t menu_chords[BB_MAX_SLOTS];
+static uint8_t menu_chord_timer_slot[BB_MAX_SLOTS];
+
+static void submit_filtered(const bb_input_state_t* raw);
+
+static void menu_chord_timer_handler(btstack_timer_source_t* ts) {
+    uint8_t slot = *(uint8_t*)btstack_run_loop_get_timer_context(ts);
+    uint8_t previous = bb_slot_current();
+    bb_slot_enter(slot);
+    if (menu_chords[slot].have_raw) submit_filtered(&menu_chords[slot].raw);
+    bb_slot_enter(previous);
+}
+
+static void menu_chord_arm(uint8_t slot, uint32_t delay_ms) {
+    menu_chord_t* c = &menu_chords[slot];
+    menu_chord_timer_slot[slot] = slot;
+    btstack_run_loop_remove_timer(&c->timer);
+    btstack_run_loop_set_timer_handler(&c->timer, menu_chord_timer_handler);
+    btstack_run_loop_set_timer_context(&c->timer, &menu_chord_timer_slot[slot]);
+    btstack_run_loop_set_timer(&c->timer, delay_ms);
+    btstack_run_loop_add_timer(&c->timer);
+}
+
+static uint32_t menu_chord_filter(uint32_t buttons) {
+    uint8_t slot = bb_slot_current();
+    if (slot >= BB_MAX_SLOTS) return buttons;
+    menu_chord_t* c = &menu_chords[slot];
+    bb_runtime_state_t rt;
+    bb_state_get(&rt);
+    if (rt.button_capabilities & BTN_HOME) { c->state = CHORD_IDLE; return buttons; }
+    uint32_t now = btstack_run_loop_get_time_ms();
+    bool both = (buttons & (BTN_SELECT | BTN_START)) == (BTN_SELECT | BTN_START);
+    bool any = (buttons & (BTN_SELECT | BTN_START)) != 0;
+    switch (c->state) {
+        case CHORD_IDLE:
+            if (!both) return buttons;
+            c->state = CHORD_PENDING;
+            c->started = now;
+            menu_chord_arm(slot, MENU_CHORD_MS);
+            return buttons & ~(BTN_SELECT | BTN_START);
+        case CHORD_PENDING:
+            if (both) {
+                uint32_t held = (uint32_t)(now - c->started);
+                if (held < MENU_CHORD_MS) { menu_chord_arm(slot, MENU_CHORD_MS - held); return buttons & ~(BTN_SELECT | BTN_START); }
+                c->state = CHORD_ACTIVE;
+                c->started = now;
+                menu_chord_arm(slot, MENU_CHORD_HOME_TAP_MS);
+                return (buttons & ~(BTN_SELECT | BTN_START)) | BTN_HOME;
+            }
+            // released early: pass a short Select+Start through, then the real state
+            c->state = CHORD_TAP;
+            c->started = now;
+            menu_chord_arm(slot, MENU_CHORD_TAP_MS);
+            return buttons | BTN_SELECT | BTN_START;
+        case CHORD_TAP:
+            if ((uint32_t)(now - c->started) < MENU_CHORD_TAP_MS) { menu_chord_arm(slot, MENU_CHORD_TAP_MS - (uint32_t)(now - c->started)); return buttons | BTN_SELECT | BTN_START; }
+            c->state = both ? CHORD_RELEASING : CHORD_IDLE;
+            return both ? (buttons & ~(BTN_SELECT | BTN_START)) : buttons;
+        case CHORD_ACTIVE:
+            // Home is sent as a short tap as soon as the hold is reached: MiSTer opens its menu on
+            // the release of the menu button, so holding Home until Select+Start were let go made
+            // the menu wait for the release.
+            if ((uint32_t)(now - c->started) < MENU_CHORD_HOME_TAP_MS) {
+                menu_chord_arm(slot, MENU_CHORD_HOME_TAP_MS - (uint32_t)(now - c->started));
+                return (buttons & ~(BTN_SELECT | BTN_START)) | BTN_HOME;
+            }
+            c->state = CHORD_RELEASING;   // tap done: swallow Select/Start until both are up
+            if (any) return buttons & ~(BTN_SELECT | BTN_START);
+            c->state = CHORD_IDLE;
+            return buttons;
+        case CHORD_RELEASING:   // swallow the leftover Select or Start until both are up
+        default:
+            if (any) return buttons & ~(BTN_SELECT | BTN_START);
+            c->state = CHORD_IDLE;
+            return buttons;
+    }
+}
+
+// ---- Hold L3+R3 -> PlayStation analog mode ------------------------------------------------------
+// The MiSTer PSX core switches its DualShock to analog on L3+R3+Up (the original pad's ANALOG
+// button) and back to digital on L3+R3+Down. Holding L3+R3 for ANALOG_HOLD_MS adds a short Up or
+// Down press, alternating each hold (the adapter can't see the core's mode, so it sends the opposite
+// of what it sent last; if out of step, hold again). The first hold after connecting sends Up.
+// A DualShock 3 shows the hold on its LEDs: all off, then one LED stepping 1 -> 4 each second, then
+// all four flash for analog on, LED 1 alone for off. L3/R3 are passed through unchanged.
+#define BTN_L3 (1u << 10)
+#define BTN_R3 (1u << 11)
+#define ANALOG_HOLD_MS 5000u
+#define ANALOG_UP_MS 150u
+#define ANALOG_FLASH_MS 1200u
+#define ANALOG_TICK_MS 100u
+#define ANALOG_RELEASE_MS 300u   // stick clicks bounce: a release this short doesn't cancel the hold
+enum { ANALOG_IDLE, ANALOG_HOLDING, ANALOG_UP, ANALOG_DONE };
+typedef struct {
+    uint8_t state;
+    bool sent_on;      // last switch sent was Up (analog on)
+    bool releasing;    // L3+R3 let go during the hold: cancel only if it stays released
+    uint32_t released_at;
+    uint32_t started;
+    btstack_timer_source_t timer;
+} analog_hold_t;
+static analog_hold_t analog_holds[BB_MAX_SLOTS];
+static uint8_t analog_timer_slot[BB_MAX_SLOTS];
+
+static uint8_t analog_leds(uint32_t held, bool on) {   // DS3 LED bits 1..4 (0x02 = LED 1 ... 0x1e = all four)
+    if (held < ANALOG_HOLD_MS) {
+        uint32_t n = held * 5u / ANALOG_HOLD_MS;   // all off, then a single LED stepping 1 -> 4, a step per 1/5 of the hold
+        return n ? (uint8_t)(1u << n) : 0x01;      // LED n = bit n; 0x01 = all off (0 would mean "normal LED")
+    }
+    if (held - ANALOG_HOLD_MS >= ANALOG_FLASH_MS) return 0;   // back to normal
+    bool lit = !(((held - ANALOG_HOLD_MS) / 150u) & 1u);
+    return lit ? (on ? 0x1e : 0x02) : 0x01;   // flash all four (on) or LED 1 (off); 0x01 = all off
+}
+
+static void analog_hold_timer_handler(btstack_timer_source_t* ts);
+
+static void analog_hold_arm(uint8_t slot) {
+    analog_hold_t* a = &analog_holds[slot];
+    analog_timer_slot[slot] = slot;
+    btstack_run_loop_remove_timer(&a->timer);
+    btstack_run_loop_set_timer_handler(&a->timer, analog_hold_timer_handler);
+    btstack_run_loop_set_timer_context(&a->timer, &analog_timer_slot[slot]);
+    btstack_run_loop_set_timer(&a->timer, ANALOG_TICK_MS);
+    btstack_run_loop_add_timer(&a->timer);
+}
+
+// Returns the D-pad to send; updates the hold state and the DS3 LEDs.
+static uint8_t analog_hold_filter(uint8_t slot, uint32_t buttons, uint8_t dpad) {
+    if (slot >= BB_MAX_SLOTS) return dpad;
+    analog_hold_t* a = &analog_holds[slot];
+    bool both = (buttons & (BTN_L3 | BTN_R3)) == (BTN_L3 | BTN_R3);
+    uint32_t now = btstack_run_loop_get_time_ms();
+    uint32_t held = (uint32_t)(now - a->started);
+    if (a->state == ANALOG_IDLE) {
+        if (!both) return dpad;
+        a->state = ANALOG_HOLDING;
+        a->started = now;
+        a->releasing = false;
+        held = 0;
+    }
+    if (a->state == ANALOG_HOLDING) {
+        if (both) a->releasing = false;
+        else if (!a->releasing) { a->releasing = true; a->released_at = now; }
+        if (a->releasing && (uint32_t)(now - a->released_at) >= ANALOG_RELEASE_MS) {   // let go early: cancel
+            a->state = ANALOG_IDLE;
+            btstack_run_loop_remove_timer(&a->timer);
+            bb_bt_host_set_slot_ds3_leds(slot, 0);
+            return dpad;
+        }
+        if (a->releasing && held >= ANALOG_HOLD_MS) held = ANALOG_HOLD_MS - 1u;   // don't switch while let go
+    }
+    if (a->state == ANALOG_HOLDING && held >= ANALOG_HOLD_MS) { a->state = ANALOG_UP; a->sent_on = !a->sent_on; }
+    if (a->state == ANALOG_UP && (!both || held >= ANALOG_HOLD_MS + ANALOG_UP_MS)) a->state = ANALOG_DONE;
+    if (a->state == ANALOG_DONE && !both && held >= ANALOG_HOLD_MS + ANALOG_FLASH_MS) {   // flash over, released
+        a->state = ANALOG_IDLE;
+        btstack_run_loop_remove_timer(&a->timer);
+        bb_bt_host_set_slot_ds3_leds(slot, 0);
+        return dpad;
+    }
+    bb_bt_host_set_slot_ds3_leds(slot, analog_leds(held, a->sent_on));
+    if (a->state != ANALOG_DONE || held < ANALOG_HOLD_MS + ANALOG_FLASH_MS) analog_hold_arm(slot);
+    else btstack_run_loop_remove_timer(&a->timer);   // done and still held: wait for release
+    if (a->state == ANALOG_UP) return (uint8_t)(dpad | (a->sent_on ? BB_DPAD_UP : BB_DPAD_DOWN));
+    return dpad;
+}
+
+static void analog_hold_timer_handler(btstack_timer_source_t* ts) {
+    uint8_t slot = *(uint8_t*)btstack_run_loop_get_timer_context(ts);
+    uint8_t previous = bb_slot_current();
+    bb_slot_enter(slot);
+    if (menu_chords[slot].have_raw) submit_filtered(&menu_chords[slot].raw);
+    bb_slot_enter(previous);
+}
+
+static void submit_filtered(const bb_input_state_t* raw) {
+    uint8_t slot = bb_slot_current();
+    if (slot < BB_MAX_SLOTS) { menu_chords[slot].raw = *raw; menu_chords[slot].have_raw = true; }
+    bb_input_state_t out = *raw;
+    out.buttons = menu_chord_filter(raw->buttons);
+    out.dpad = analog_hold_filter(slot, raw->buttons, raw->dpad);
+    bb_input_submit(&out);
+}
 
 static void submit_state(const bb_input_state_t* state) {
     if (!state) return;
@@ -95,7 +404,7 @@ static void submit_state(const bb_input_state_t* state) {
     }
     last_input_state = normalized;
     have_last_input_state = true;
-    bb_input_submit(&normalized);
+    submit_filtered(&normalized);
 }
 
 static int16_t axis12_quantized(uint16_t value, uint16_t center, uint16_t range) {
@@ -353,6 +662,8 @@ static bool is_ultimate2c(void) {
     return identity.kind == BB_CONTROLLER_8BITDO && identity.vendor_id == 0x2dc8 && identity.product_id == 0x301b;
 }
 
+static bool descriptor_has_menu_button(void);
+
 static void normalize_8bitdo_buttons(bb_input_state_t* state, uint32_t* capabilities, bool analog_lt, bool analog_rt) {
     if (!state || !capabilities) return;
     uint32_t src_buttons = state->buttons;
@@ -387,6 +698,17 @@ static void normalize_8bitdo_buttons(bb_input_state_t* state, uint32_t* capabili
     if (!pro3 && model) {
         static const uint8_t sequential[] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13};
         static const uint8_t paddles[] = {0,1,17,2,3,16,4,5,6,7,8,9,12,10,11,13};
+        // X-input mode over Bluetooth (Home in its own System Main Menu report): Xbox button order
+        // A B X Y LB RB View Menu LS RS, and the triggers are analog axes only.
+        static const uint8_t xinput[] = {0,1,2,3,4,5,8,9,10,11};
+        if (!(src_caps & 0xffffc000u) && descriptor_has_menu_button()) {
+            map_8bitdo_layout(state, capabilities, xinput, sizeof(xinput));
+            if (analog_lt) *capabilities |= 1u << 6;
+            if (analog_rt) *capabilities |= 1u << 7;
+            if (state->lt > 10) state->buttons |= 1u << 6;   // the triggers also press L2/R2, as on Xbox pads
+            if (state->rt > 10) state->buttons |= 1u << 7;
+            return;
+        }
         if (src_caps & 0xffffc000u) map_8bitdo_layout(state, capabilities, paddles, sizeof(paddles));
         else map_8bitdo_layout(state, capabilities, sequential, sizeof(sequential));
         if (!analog_lt && (state->buttons & (1u << 6))) state->lt = 255;
@@ -790,6 +1112,20 @@ static bool parse_ds4_common(const uint8_t* p, uint16_t len, uint8_t base, bool 
         uint8_t pct = level >= 10 ? 100 : (uint8_t)(level * 10u + 5u);
         bb_state_update_battery(true, pct, (v & 0x10) ? 2 : 1);
     }
+    if(bb_usb_touch_mouse_enabled()) {
+        bb_pointer_sample_t pointer;
+        if(bb_ds4_pointer_decode(&driver_slots[bb_slot_current()].pointer,p,len,
+            to_ms_since_boot(get_absolute_time()),&pointer)) {
+            bb_ds4_gyro_apply(&driver_slots[bb_slot_current()].ds4_gyro,p,
+                to_ms_since_boot(get_absolute_time()),bb_ds4_aim_current(),
+                driver_slots[bb_slot_current()].pointer.touching,&s,&pointer);
+            bb_usb_touch_mouse_submit(pointer,false);
+            s.buttons&=~(1u<<13); /* Touchpad click belongs to the mouse in this mode. */
+        }
+    } else {
+        memset(&driver_slots[bb_slot_current()].pointer,0,sizeof(bb_ds4_pointer_t));
+        memset(&driver_slots[bb_slot_current()].ds4_gyro,0,sizeof(bb_ds4_gyro_t));
+    }
     submit_state(&s);
     return true;
 }
@@ -1103,6 +1439,23 @@ static bool is_xbox_controller(void) {
            identity.kind == BB_CONTROLLER_XBOX_ADAPTIVE;
 }
 
+// 8BitDo pads in X-input mode over Bluetooth (e.g. SN30 Pro) send Home as a separate report:
+// Generic Desktop System Main Menu (0x85), like the arcade stick. True when the descriptor has one.
+static bool descriptor_has_menu_button(void) {
+    if (!hid_descriptor || !hid_descriptor_len) return false;
+    if (descriptor_menu_button >= 0) return descriptor_menu_button == 1;
+    bool found = false;
+    btstack_hid_usage_iterator_t iterator;
+    btstack_hid_usage_iterator_init(&iterator, hid_descriptor, hid_descriptor_len, HID_REPORT_TYPE_INPUT);
+    while (btstack_hid_usage_iterator_has_more(&iterator)) {
+        btstack_hid_usage_item_t item;
+        btstack_hid_usage_iterator_get_item(&iterator, &item);
+        if (item.usage_page == HID_USAGE_PAGE_GENERIC_DESKTOP && item.usage == 0x85) { found = true; break; }
+    }
+    descriptor_menu_button = found ? 1 : 0;
+    return found;
+}
+
 static bool parse_generic(const uint8_t* report, uint16_t length) {
     if (!hid_descriptor || !hid_descriptor_len || !report || !length) return false;
     btstack_hid_parser_t parser;
@@ -1113,6 +1466,8 @@ static bool parse_generic(const uint8_t* report, uint16_t length) {
     bool m30 = identity.kind == BB_CONTROLLER_8BITDO && eightbitdo_name_has("m30");
     bool micro = identity.kind == BB_CONTROLLER_8BITDO && eightbitdo_name_has("micro");
     bool xbox = is_xbox_controller();
+    // Home arrives in its own report (arcade stick, or an 8BitDo pad in X-input mode)
+    bool home_report = arcade || (identity.kind == BB_CONTROLLER_8BITDO && descriptor_has_menu_button());
     if (arcade || m30 || micro || xbox) {
         bool numbered = btstack_hid_report_id_declared(hid_descriptor, hid_descriptor_len);
         int expected = btstack_hid_get_report_size_for_id(numbered ? report[0] : HID_REPORT_ID_UNDEFINED, HID_REPORT_TYPE_INPUT, hid_descriptor, hid_descriptor_len);
@@ -1139,7 +1494,7 @@ static bool parse_generic(const uint8_t* report, uint16_t length) {
         int32_t minimum = m30 ? parser.descriptor_usage_item.global_logical_minimum : parser.usage_iterator.global_logical_minimum;
         int32_t maximum = parser.usage_iterator.global_logical_maximum;
         btstack_hid_parser_get_field(&parser, &page, &usage, &value);
-        if (arcade && ((page == HID_USAGE_PAGE_GENERIC_DESKTOP && usage == 0x85) || (page == 0x0c && usage == 0x0223))) {
+        if (home_report && ((page == HID_USAGE_PAGE_GENERIC_DESKTOP && usage == 0x85) || (page == 0x0c && usage == 0x0223))) {
             home_present = true;
             home_pressed |= value != 0;
             continue;
@@ -1266,6 +1621,15 @@ static bool parse_generic(const uint8_t* report, uint16_t length) {
             if (axis_present[1]) s.y = dinput_axis(axes[1]);
             if (axis_present[2]) s.rx = dinput_axis(axes[2]);
             if (axis_present[5]) s.ry = dinput_axis(axes[5]);
+        } else if (!ultimate2c && descriptor_has_menu_button()) {
+            // X-input mode (fixed Xbox layout): X/Y left stick, Rx/Ry right stick (16-bit),
+            // Z/Rz the triggers (10-bit). The D-input axis guessing would misread these.
+            if (axis_present[0]) s.x = hid_axis(axes[0], axis_minimum[0], axis_maximum[0]);
+            if (axis_present[1]) s.y = hid_axis(axes[1], axis_minimum[1], axis_maximum[1]);
+            if (axis_present[3]) s.rx = hid_axis(axes[3], axis_minimum[3], axis_maximum[3]);
+            if (axis_present[4]) s.ry = hid_axis(axes[4], axis_minimum[4], axis_maximum[4]);
+            if (axis_present[2]) { s.lt = generic_trigger(axes[2], axis_minimum[2], axis_maximum[2]); analog_lt = true; }
+            if (axis_present[5]) { s.rt = generic_trigger(axes[5], axis_minimum[5], axis_maximum[5]); analog_rt = true; }
         } else if (!ultimate2c) apply_8bitdo_axes(&s, axes, axis_present, axis_minimum, axis_maximum, &analog_lt, &analog_rt);
         normalize_8bitdo_buttons(&s, &button_capabilities, analog_lt, analog_rt);
     }
@@ -1276,13 +1640,22 @@ static bool parse_generic(const uint8_t* report, uint16_t length) {
         if (analog_rt) button_capabilities |= 1u << 7;
         s.lt = s.rt = 0;
     }
-    if (arcade && home_present) {
+    if (home_report && home_present) {
+        if (!primary_input && !arcade) {
+            // a Home-only report: keep the rest of the pad state and the button capabilities as they are
+            if (have_last_input_state) s = last_input_state;
+            s.buttons &= ~(1u << 12);
+            if (home_pressed) s.buttons |= 1u << 12;
+            submit_state(&s);
+            return true;
+        }
         if (!primary_input && have_last_input_state) s = last_input_state;
         s.buttons &= ~(1u << 12);
         if (home_pressed) s.buttons |= 1u << 12;
         button_capabilities |= 1u << 12;
-    } else if (arcade && have_last_input_state) {
+    } else if (home_report && have_last_input_state) {
         s.buttons |= last_input_state.buttons & (1u << 12);
+        if (!arcade) button_capabilities |= 1u << 12;
     }
     s.buttons = canonicalize_buttons(s.buttons);
     if (identity.kind == BB_CONTROLLER_8BITDO && eightbitdo_name_has("nes30") &&
@@ -1371,11 +1744,32 @@ static bool parse_8bitdo_arcade(const uint8_t* report, uint16_t length) {
     return parse_generic(report, length);
 }
 
+// 8BitDo in X-input mode (its descriptor has the separate System Main Menu report): rumble then
+// uses the Xbox-style output report 3 instead of the D-input report 5.
+bool bb_driver_8bitdo_xinput_mode(void) {
+    return identity.kind == BB_CONTROLLER_8BITDO && descriptor_has_menu_button();
+}
+
 void bb_driver_reset(void) {
+    {
+        uint8_t slot = bb_slot_current();
+        if (slot < BB_MAX_SLOTS) {
+            btstack_run_loop_remove_timer(&menu_chords[slot].timer);
+            menu_chords[slot].state = CHORD_IDLE;
+            menu_chords[slot].have_raw = false;
+            btstack_run_loop_remove_timer(&analog_holds[slot].timer);
+            analog_holds[slot].state = ANALOG_IDLE;
+            analog_holds[slot].sent_on = false;
+        }
+    }
+    bb_usb_touch_mouse_release();
+    memset(&driver_slots[bb_slot_current()].pointer,0,sizeof(bb_ds4_pointer_t));
+    memset(&driver_slots[bb_slot_current()].ds4_gyro,0,sizeof(bb_ds4_gyro_t));
     bb_usb_set_press_latch(false);
     memset(&identity, 0, sizeof(identity));
     hid_descriptor = NULL;
     hid_descriptor_len = 0;
+    descriptor_menu_button = -1;
     diagnostic_report_length = 0;
     diagnostic_report_original_length = 0;
     diagnostic_report_sequence = 0;
@@ -1435,6 +1829,7 @@ void bb_driver_set_hid_descriptor(const uint8_t* descriptor, uint16_t length) {
         hid_descriptor = storage;
         hid_descriptor_len = length;
     }
+    descriptor_menu_button = -1;
     if (have_early_arcade_battery_report && bb_driver_battery_report_id() == 4 && bb_driver_battery_report_type() == HID_REPORT_TYPE_INPUT) {
         bb_driver_handle_battery_report(early_arcade_battery_report, sizeof(early_arcade_battery_report));
     }
