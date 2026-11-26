@@ -4,6 +4,7 @@
 #include "led_status.h"
 #include "usb_device.h"
 #include "btstack_run_loop.h"
+#include "bt_host.h"
 #include "hardware/gpio.h"
 #include "hardware/structs/ioqspi.h"
 #include "hardware/structs/sio.h"
@@ -13,7 +14,7 @@
 
 // BOOTSEL button:
 //   1 short press           start/stop pairing
-//   2 short presses         X-Input output mode
+//   2 short presses         X-Input (X360) output mode
 //   3 short presses         DualSense output mode
 //   4 short presses         automatic output mode (detects the host)
 //   hold 1 s                start/stop pairing
@@ -63,7 +64,7 @@ static void select_output_mode(bb_output_mode_t mode) {
 
 static void handle_clicks(uint8_t count) {
     if (count == 1) toggle_pairing();
-    else if (count == 2) select_output_mode(BB_OUTPUT_XINPUT);
+    else if (count == 2) select_output_mode(BB_OUTPUT_X360);
     else if (count == 3) select_output_mode(BB_OUTPUT_DUALSENSE);
     else if (count == 4) {
         // Auto is never the presented mode, so always (re)start the detection.

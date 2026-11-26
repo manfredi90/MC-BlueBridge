@@ -100,7 +100,7 @@ void bb_auto_task(void) {
         bool reenumerate = stage != STAGE_OFF || generation != 0;
         generation_seen = generation;
         detail = "";
-        start_stage(STAGE_XINPUT, BB_OUTPUT_XINPUT, reenumerate, now);
+        start_stage(STAGE_XINPUT, BB_OUTPUT_X360, reenumerate, now);
         return;
     }
 
@@ -117,7 +117,7 @@ void bb_auto_task(void) {
             if (!unmounted_since) unmounted_since = now;
             else if ((uint32_t)(now - unmounted_since) >= AUTO_LOST_HOST_MS) {
                 detail = "";
-                start_stage(STAGE_XINPUT, BB_OUTPUT_XINPUT, true, now);
+                start_stage(STAGE_XINPUT, BB_OUTPUT_X360, true, now);
             }
         }
         return;
@@ -126,7 +126,7 @@ void bb_auto_task(void) {
     if (mounted && !mounted_at) mounted_at = now;
     uint8_t evidence = pending_evidence;
     if (evidence) {
-        lock(stage == STAGE_XINPUT ? BB_OUTPUT_XINPUT : BB_OUTPUT_DUALSENSE, evidence_name(evidence), false, now);
+        lock(stage == STAGE_XINPUT ? BB_OUTPUT_X360 : BB_OUTPUT_DUALSENSE, evidence_name(evidence), false, now);
         return;
     }
     bool timed_out = mounted_at ? (uint32_t)(now - mounted_at) >= AUTO_WAIT_AFTER_MOUNT_MS

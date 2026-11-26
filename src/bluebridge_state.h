@@ -5,10 +5,10 @@
 #include "ds4_aim.h"
 #include "lightbar.h"
 
-#define BLUEBRIDGE_VERSION "1.2.1"
-#define BLUEBRIDGE_FIRMWARE_MANIFEST "MCBLUEBRIDGE|" BLUEBRIDGE_VERSION "|PICO2W|SCHEMA=14"
+#define BLUEBRIDGE_VERSION "2.0.0"
+#define BLUEBRIDGE_FIRMWARE_MANIFEST "MCBLUEBRIDGE|" BLUEBRIDGE_VERSION "|PICO2W|SCHEMA=16"
 #define BLUEBRIDGE_PROTOCOL_VERSION 2
-#define BB_CONFIG_SCHEMA 14
+#define BB_CONFIG_SCHEMA 16
 #define BB_MAX_NAME 32
 #define BB_MAX_PROFILE_NAME 24
 #define BB_MAX_CONTROLLERS 8
@@ -35,8 +35,9 @@ typedef enum {
     BB_OUTPUT_SWITCH = 4,
     BB_OUTPUT_XBOX360 = 5,
     BB_OUTPUT_DUALSENSE = 6,
+    BB_OUTPUT_X360 = 7,
     // Test build: automatic mode, detects the host (X-Input, DualSense or Switch).
-    BB_OUTPUT_AUTO = 7
+    BB_OUTPUT_AUTO = 8
 } bb_output_mode_t;
 
 bool bb_touch_mouse_get(void);
@@ -122,8 +123,16 @@ typedef struct __attribute__((packed)) {
     uint8_t touch_mouse_enabled;
     bb_ds4_aim_t ds4_aim;
     bb_lightbar_config_t lightbar;
+    uint8_t ds4_right_click;
+    // Zero inherits the adapter default. Indexed with controllers[], not profiles.
+    uint8_t controller_output_overrides[BB_MAX_CONTROLLERS];
 } bb_config_t;
 
+#define BB_CONFIG_V15_SIZE offsetof(bb_config_t, controller_output_overrides)
+#define BB_CONFIG_V14_SIZE offsetof(bb_config_t, ds4_right_click)
+bool bb_ds4_right_click_get(void);
+bool bb_ds4_right_click_current(void);
+void bb_ds4_right_click_set(bool enabled);
 #define BB_CONFIG_V13_SIZE offsetof(bb_config_t, touch_mouse_enabled)
 void bb_lightbar_get(bb_lightbar_config_t* out);
 bool bb_lightbar_palette_set(uint8_t theme,const bb_rgb_t players[4]);
@@ -133,6 +142,13 @@ bb_rgb_t bb_lightbar_colour(unsigned index,unsigned slot);
 #define BB_CONFIG_V12_SIZE offsetof(bb_config_t, blocked_device_count)
 #define BB_CONFIG_V11_SIZE offsetof(bb_config_t, multi_controller)
 bool bb_multi_mode(void);
+// Physical Bluetooth slots remain stable while an override changes USB layout.
+bool bb_multi_transport_mode(void);
+uint8_t bb_output_slot(void);
+uint8_t bb_output_default(void);
+bool bb_controller_output_set(uint8_t index, uint32_t id, uint8_t mode);
+bool bb_controller_output_get(uint8_t index, uint32_t* id, uint8_t* mode);
+void bb_output_recover(void);
 bool bb_multi_mode_set(bool enabled);
 uint8_t bb_slot_current(void);
 void bb_slot_enter(uint8_t slot);
@@ -187,7 +203,7 @@ typedef struct {
 } bb_runtime_state_t;
 
 void bb_state_init(void);
-void bb_state_set_controller(bool connected, int idx, const char* name);
+bool bb_state_set_controller(bool connected, int idx, const char* name);
 void bb_state_set_scanning(bool scanning);
 void bb_state_set_pairing(bool pairing);
 void bb_state_set_bt_ready(bool ready);

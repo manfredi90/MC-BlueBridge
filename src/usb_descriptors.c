@@ -31,19 +31,22 @@ uint8_t const* tud_descriptor_device_cb(void) {
     device_desc.idVendor = 0x2E8A;
     device_desc.idProduct = 0x10B1;
     device_desc.bcdDevice = 0x0100;
+    device_desc.iManufacturer = mode == BB_OUTPUT_MISTER ? 0 : 1;
     if (bb_multi_mode()) {
         device_desc.idProduct = 0x10B3;
     } else if (mode == BB_OUTPUT_MISTER) {
         device_desc.idProduct = (uint16_t)(0xB000u | (bb_current_mister_identity() & 0x0fffu));
     } else if (mode == BB_OUTPUT_XINPUT) {
-        // Test build: use the pid.codes open-source vendor ID (with a pid.codes
-        // test PID) instead of Raspberry Pi's. Linux's xpad driver only binds
-        // X-Input interfaces from vendors on its list; 0x1209 is on it, 0x2E8A is
-        // not, so MiSTer (and other Linux hosts) did not recognise this mode.
-        // Windows still binds through the XUSB10 Microsoft OS descriptor.
-        device_desc.idVendor = 0x1209;
-        device_desc.idProduct = 0x0005;
+        device_desc.idVendor = 0x2E8A;
+        device_desc.idProduct = 0x10B2;
         device_desc.bcdDevice = 0x0101;
+    } else if (mode == BB_OUTPUT_X360) {
+        device_desc.bDeviceClass = 0xff;
+        device_desc.bDeviceSubClass = 0xff;
+        device_desc.bDeviceProtocol = 0xff;
+        device_desc.idVendor = 0x045e;
+        device_desc.idProduct = 0x028e;
+        device_desc.bcdDevice = 0x0114;
     } else if (mode == BB_OUTPUT_XBOX360) {
         device_desc.bDeviceClass = 0xff;
         device_desc.bDeviceSubClass = 0xff;
@@ -153,6 +156,8 @@ static const uint8_t xinput_config_desc[] = {
     TUD_CDC_DESCRIPTOR(1, 4, 0x83, 8, 0x04, 0x84, 64)
 };
 
+_Static_assert(sizeof(xinput_config_desc) == XINPUT_CONFIG_LEN, "X360 USB configuration length");
+
 static const uint8_t xbox360_config_desc[XBOX360_CONFIG_LEN] = {
     0x09,0x02,0x99,0x00,0x04,0x01,0x00,0xa0,0xfa,
     0x09,0x04,0x00,0x00,0x02,0xff,0x5d,0x01,0x00,
@@ -186,7 +191,7 @@ uint8_t const* tud_descriptor_configuration_cb(uint8_t index) {
     (void)index;
     bb_output_mode_t mode = bb_output_mode();
     if (mode == BB_OUTPUT_MISTER) return bb_touch_mouse_current()?touch_config_desc:mister_config_desc;
-    if (mode == BB_OUTPUT_XINPUT) return xinput_config_desc;
+    if (mode == BB_OUTPUT_XINPUT || mode == BB_OUTPUT_X360) return xinput_config_desc;
     if (mode == BB_OUTPUT_XBOX360) return xbox360_config_desc;
     if (mode == BB_OUTPUT_DUALSENSE) return dualsense_config_desc;
     if (mode == BB_OUTPUT_SWITCH) return switch_config_desc;
@@ -215,9 +220,10 @@ static const char* string_for_index(uint8_t index) {
     switch (index) {
         case 1:
             if (mode == BB_OUTPUT_DUALSENSE) return "Sony Interactive Entertainment";
+            if (mode == BB_OUTPUT_X360) return "Microsoft";
             return mode == BB_OUTPUT_XBOX360 ? "\xC2\xA9Microsoft Corporation" : "MC BlueBridge";
         case 2:
-            if (mode == BB_OUTPUT_XBOX360) return "Xbox 360 Controller";
+            if (mode == BB_OUTPUT_XBOX360 || mode == BB_OUTPUT_X360) return "Xbox 360 Controller";
             if (mode == BB_OUTPUT_DUALSENSE) return "DualSense Wireless Controller";
             bb_adapter_name_get(adapter_product_name, sizeof(adapter_product_name));
             return adapter_product_name;
@@ -236,7 +242,7 @@ static const char* string_for_index(uint8_t index) {
 
 uint16_t const* tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
     (void)langid;
-    if (index == 0xee && bb_output_mode() == BB_OUTPUT_XINPUT) {
+    if (index == 0xee && (bb_output_mode() == BB_OUTPUT_XINPUT || bb_output_mode() == BB_OUTPUT_X360)) {
         bb_auto_evidence(BB_AUTO_EVIDENCE_WINDOWS);
         static const uint16_t os_string[] = {0x0312, 'M', 'S', 'F', 'T', '1', '0', '0', 0x0020};
         return os_string;

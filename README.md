@@ -114,7 +114,7 @@ In this test build, quick presses of BOOTSEL also work:
 | Presses | Action |
 |---|---|
 | 1 | Start or stop pairing |
-| 2 | Switch to X-Input mode |
+| 2 | Switch to X-Input (X360) mode |
 | 3 | Switch to DualSense mode |
 | 4 | Switch to automatic mode |
 
@@ -169,7 +169,7 @@ Profiles can instead share one MiSTer identity when you want multiple BlueBridge
 
 ## USB output modes
 
-BlueBridge supports six USB output modes.
+BlueBridge supports seven USB output modes, plus the automatic mode of this test build.
 
 ### MiSTer
 
@@ -177,7 +177,7 @@ The default and recommended mode for MiSTer.
 
 It supports BlueBridge's full profile system and separate MiSTer controller identities for different profiles.
 
-### X-Input
+### X-Input (BlueBridge)
 
 Presents BlueBridge as an Xbox-style X-Input controller.
 
@@ -185,7 +185,11 @@ Useful for Windows and other software designed around Xbox controllers.
 
 Analog triggers and rumble are supported where available.
 
-In this test build, X-Input mode uses the pid.codes open-source USB vendor ID (1209) instead of Raspberry Pi's, so that Linux's Xbox controller driver, and therefore MiSTer, recognises it too. MiSTer Companion does not detect the adapter while this mode is active: hold **BOOTSEL for 5 seconds** to return to MiSTer mode and manage it.
+### X-Input (X360)
+
+The same X-Input controller under the USB IDs of a wired Xbox 360 controller (045E:028E), so that Linux's Xbox controller driver, and therefore MiSTer, recognises it too. The BlueBridge management interface may not be available in this mode: hold **BOOTSEL for 5 seconds** to return to MiSTer mode and manage it.
+
+In this test build, both X-Input modes are polled every 1 ms.
 
 ### Generic HID
 
@@ -217,9 +221,9 @@ Select the mode by its number (`6`) with the management command `BB1|1|OUTPUT_SE
 
 ### Auto (test build)
 
-Detects the host and picks the output mode by itself: BlueBridge first presents itself as an X-Input controller and stays in X-Input if the host loads an Xbox driver (Windows, Linux, MiSTer); otherwise it tries DualSense and stays there if the host reads the DualSense's feature reports (macOS); otherwise it settles on Nintendo Switch mode. Detection takes about one second on Windows and MiSTer, about three on macOS and up to about six on a Switch, during which the adapter may reconnect once or twice. It restarts when the adapter loses its host for five seconds.
+Detects the host and picks the output mode by itself: BlueBridge first presents itself as an X-Input (X360) controller and stays in X-Input if the host loads an Xbox driver (Windows, Linux, MiSTer); otherwise it tries DualSense and stays there if the host reads the DualSense's feature reports (macOS); otherwise it settles on Nintendo Switch mode. Detection takes about one second on Windows and MiSTer, about three on macOS and up to about six on a Switch, during which the adapter may reconnect once or twice. It restarts when the adapter loses its host for five seconds.
 
-Select it with four quick BOOTSEL presses or with the management command `BB1|1|OUTPUT_SET|7`. In this mode `STATUS` reports the mode in use as `output_mode`, so MiSTer Companion shows it, plus `auto` (true), `auto_stage` and why the mode was chosen (`auto_detail`). Selecting any other mode, from Companion too, turns detection off.
+Select it with four quick BOOTSEL presses or with the management command `BB1|1|OUTPUT_SET|8`. In this mode `STATUS` reports the mode in use as `output_mode`, so MiSTer Companion shows it, plus `auto` (true), `auto_stage` and why the mode was chosen (`auto_detail`). Selecting any other mode, from Companion too, turns detection off.
 
 Changing USB output mode is persistent and automatically re-enumerates BlueBridge with the appropriate USB identity.
 

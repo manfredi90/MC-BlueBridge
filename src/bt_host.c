@@ -29,9 +29,9 @@ static uint32_t ds4_lightbar_crc_byte(uint32_t crc,uint8_t byte) {
     for(unsigned i=0;i<8;i++)crc=(crc>>1)^((crc&1u)?0xedb88320u:0);
     return crc;
 }
-void bb_ds4_output_build(uint8_t p[78],uint8_t strength,bb_rgb_t colour,bool low_battery,bool update_blink) {
+void bb_ds4_output_build(uint8_t p[78],uint8_t big,uint8_t small,bb_rgb_t colour,bool low_battery,bool update_blink) {
     memset(p,0,78);p[0]=0x11;p[1]=0xc4;p[3]=update_blink?0x07:0x03;
-    p[6]=strength;p[7]=strength;p[8]=colour.r;p[9]=colour.g;p[10]=colour.b;
+    p[6]=small;p[7]=big;p[8]=colour.r;p[9]=colour.g;p[10]=colour.b;
     /* DS4 hardware timing is in 10 ms units: 1 s on, 1 s off. Sending
      * zero for both durations restores a solid light. Only update blink timing
      * when it changes, so repeated rumble reports cannot restart its phase. */
@@ -169,7 +169,8 @@ typedef struct {
     uint8_t dualsense_output_seq;
     uint8_t ds4_output_report[78];
     bb_rgb_t ds4_lightbar_sent;
-    bool ds4_lightbar_valid;
+    bool ds4_lightbar_valid,ds4_rumble_retry;
+    bb_ds4_motors_t ds4_motors_sent;
     bool ds4_low_battery,ds4_blink_sent;
     uint32_t ds4_lightbar_retry_at;
     bool ds4_descriptor_ready;
@@ -243,7 +244,7 @@ static int slot_for_address(const uint8_t addr[6]) {
     return slot_for_address_except(addr, -1);
 }
 static bool any_setup(void) {
-    for (int i = 0; i < (bb_multi_mode() ? BB_MAX_SLOTS : 1); ++i) {
+    for (int i = 0; i < (bb_multi_transport_mode() ? BB_MAX_SLOTS : 1); ++i) {
         if (host_slots[i].classic_connecting || host_slots[i].ble_connecting || host_slots[i].classic_setup_pending) return true;
     }
     return false;
@@ -254,8 +255,18 @@ static bool ble_setup_elsewhere(uint8_t owner) {
     }
     return false;
 }
+static volatile bool recovery_command;
+static uint32_t recovery_until;
+static bool recovery_waiting(void) {
+    return recovery_command || (recovery_until && (int32_t)(recovery_until-btstack_run_loop_get_time_ms())>0);
+}
+static volatile bool multi_disconnect_requests[BB_MAX_SLOTS];
 static int free_slot(void) {
-    for (int i = 0; i < (bb_multi_mode() ? BB_MAX_SLOTS : 1); ++i) {
+    if (recovery_waiting()) return -1;
+    if (!bb_multi_mode()) {
+        for (unsigned i=0;i<BB_MAX_SLOTS;++i) if(host_slots[i].current_controller_index>=0) return -1;
+    }
+    for (int i = 0; i < (bb_multi_transport_mode() ? BB_MAX_SLOTS : 1); ++i) {
         bb_host_context_t* c = &host_slots[i];
         if (c->current_controller_index < 0 && !c->classic_connecting && !c->ble_connecting && !c->classic_hid_cid && c->classic_handle == HCI_CON_HANDLE_INVALID && c->pending_classic_handle == HCI_CON_HANDLE_INVALID && c->le_handle == HCI_CON_HANDLE_INVALID && c->closing_handle == HCI_CON_HANDLE_INVALID) return i;
     }
@@ -268,7 +279,7 @@ static bool connected_controller_present(void) {
     return false;
 }
 static bool multi_discovery_paused(uint32_t now) {
-    if (!bb_multi_mode() || pairing || !connection_settle_active) return false;
+    if (!bb_multi_transport_mode() || pairing || !connection_settle_active) return false;
     if (!connected_controller_present() || (uint32_t)(now - connection_settle_started) >= 1500u) {
         connection_settle_active = false;
         return false;
@@ -276,7 +287,7 @@ static bool multi_discovery_paused(uint32_t now) {
     return true;
 }
 static int route_hci(const uint8_t* packet, uint16_t size) {
-    if (!bb_multi_mode()) return 0;
+    if (!bb_multi_transport_mode()) return 0;
     if (size < 2) return -1;
     uint8_t event = packet[0];
     bd_addr_t addr;
@@ -336,7 +347,7 @@ bool bb_bt_host_diagnostics(char* out, size_t size) {
 }
 
 bool bb_bt_host_diagnostics_slot(uint8_t slot, char* out, size_t size) {
-    if (slot >= (bb_multi_mode() ? BB_MAX_SLOTS : 1)) return false;
+    if (slot >= (bb_multi_transport_mode() ? BB_MAX_SLOTS : 1)) return false;
     const bb_host_context_t* context = &host_slots[slot];
     if (!out || size < 512) return false;
     char name_hex[65];
@@ -595,18 +606,26 @@ static bool send_switch_report_mode(uint8_t mode) {
     return send_classic_report(classic_hid_cid, 0x01, payload, sizeof(payload)) == ERROR_CODE_SUCCESS;
 }
 
-static bool send_ds4_rumble(uint8_t strength) {
-    if (!classic_hid_cid || current_identity.kind != BB_CONTROLLER_DUALSHOCK4 || ds4_activation_step == 2) return false;
+static bool send_ds4_motors(bb_ds4_motors_t motors) {
+    if (!classic_hid_cid || current_identity.kind != BB_CONTROLLER_DUALSHOCK4 || ds4_activation_step == 2) {
+        host_slots[bb_slot_current()].ds4_rumble_retry=classic_hid_cid&&current_identity.kind==BB_CONTROLLER_DUALSHOCK4;
+        return false;
+    }
     uint8_t* report = ds4_output_report;
     bb_rgb_t colour=bb_lightbar_colour((unsigned)current_controller_index,bb_slot_current());
     bb_runtime_state_t state;bb_state_get(&state);
     bb_host_context_t* slot=&host_slots[bb_slot_current()];
     slot->ds4_low_battery=bb_ds4_low_battery_blink(slot->ds4_low_battery,state.battery_supported,state.battery_percent,state.battery_state);
     bool update_blink=!slot->ds4_lightbar_valid||slot->ds4_blink_sent!=slot->ds4_low_battery;
-    bb_ds4_output_build(report,strength,colour,slot->ds4_low_battery,update_blink);
-    bool sent=send_classic_report(classic_hid_cid, 0x11, &report[1], 77) == ERROR_CODE_SUCCESS;
-    if(sent){slot->ds4_lightbar_sent=colour;slot->ds4_lightbar_valid=true;slot->ds4_blink_sent=slot->ds4_low_battery;}
+    bb_ds4_output_build(report,motors.big,motors.small,colour,slot->ds4_low_battery,update_blink);
+    uint8_t status=send_classic_report(classic_hid_cid, 0x11, &report[1], 77);
+    bool sent=status==ERROR_CODE_SUCCESS;slot->ds4_rumble_retry=status==ERROR_CODE_COMMAND_DISALLOWED;
+    if(sent){slot->ds4_motors_sent=motors;slot->ds4_lightbar_sent=colour;slot->ds4_lightbar_valid=true;slot->ds4_blink_sent=slot->ds4_low_battery;}
     return sent;
+}
+
+static bool send_ds4_rumble(uint8_t strength) {
+    return send_ds4_motors((bb_ds4_motors_t){strength,strength});
 }
 
 static void service_ds4_lightbar(uint32_t now) {
@@ -619,7 +638,7 @@ static void service_ds4_lightbar(uint32_t now) {
     if(slot->ds4_lightbar_valid&&slot->ds4_blink_sent==slot->ds4_low_battery&&!memcmp(&colour,&slot->ds4_lightbar_sent,sizeof(colour)))return;
     if((int32_t)(now-slot->ds4_lightbar_retry_at)<0)return;
     slot->ds4_lightbar_retry_at=now+100u;
-    send_ds4_rumble(rumble_active?rumble_active_strength:0);
+    send_ds4_motors(slot->ds4_motors_sent);
 }
 
 // Set when the activation feature report is sent; the first SET_REPORT_RESPONSE after it sends the LED report.
@@ -1007,7 +1026,7 @@ static bool send_xbox_ble_rumble(uint8_t strength) {
     return false;
 }
 
-static bool send_current_rumble(uint8_t strength) {
+static bool send_current_rumble(uint8_t strength,bool stop) {
     switch (current_identity.kind) {
         case BB_CONTROLLER_XBOX_SERIES:
         case BB_CONTROLLER_XBOX_WIRELESS:
@@ -1017,7 +1036,7 @@ static bool send_current_rumble(uint8_t strength) {
         case BB_CONTROLLER_DUALSENSE_EDGE:
             return send_dualsense_rumble(strength);
         case BB_CONTROLLER_DUALSHOCK4:
-            return send_ds4_rumble(strength);
+            return send_ds4_motors(bb_ds4_rumble_motors(strength,rumble_motor_big,rumble_motor_small,stop));
         case BB_CONTROLLER_DUALSHOCK3:
             return send_ds3_rumble(strength);
         case BB_CONTROLLER_NSO_N64:
@@ -1048,25 +1067,27 @@ static void service_rumble(void) {
         rumble_motor_big = rumble_request_big;
         rumble_motor_small = rumble_request_small;
         rumble_request_pending = false;
-        if (send_current_rumble(strength)) {
-            rumble_active = strength != 0;
+        if (send_current_rumble(strength,false)) {
+            rumble_active = strength != 0 || (current_identity.kind==BB_CONTROLLER_DUALSHOCK4&&(rumble_motor_big||rumble_motor_small));
             rumble_active_strength = strength;
             rumble_stop_at = now + duration;
             rumble_refresh_at = now + 80u;
         } else if ((xbox_ble_connected() && xbox_rumble_retry) || (eightbitdo64_ble_connected() && eightbitdo64_rumble_retry) ||
-                   (current_identity.kind == BB_CONTROLLER_DUALSHOCK3 && ds3_rumble_retry)) {
+                   (current_identity.kind == BB_CONTROLLER_DUALSHOCK3 && ds3_rumble_retry) ||
+                   (current_identity.kind == BB_CONTROLLER_DUALSHOCK4 && host_slots[bb_slot_current()].ds4_rumble_retry)) {
             rumble_request_pending = true;
         }
     }
     if (rumble_active && (int32_t)(now - rumble_stop_at) < 0 && (int32_t)(now - rumble_refresh_at) >= 0) {
         bool refresh = current_identity.kind == BB_CONTROLLER_SWITCH2_PRO || (current_identity.kind == BB_CONTROLLER_8BITDO && classic_switch_protocol);
-        if (refresh) send_current_rumble(rumble_active_strength);
+        if (refresh) send_current_rumble(rumble_active_strength,false);
         rumble_refresh_at = now + 80u;
     }
     if (rumble_active && (int32_t)(now - rumble_stop_at) >= 0) {
-        bool stopped = send_current_rumble(0);
+        bool stopped = send_current_rumble(0,true);
         if (!stopped && ((xbox_ble_connected() && xbox_rumble_retry) || (eightbitdo64_ble_connected() && eightbitdo64_rumble_retry) ||
-                         (current_identity.kind == BB_CONTROLLER_DUALSHOCK3 && ds3_rumble_retry))) return;
+                         (current_identity.kind == BB_CONTROLLER_DUALSHOCK3 && ds3_rumble_retry) ||
+                   (current_identity.kind == BB_CONTROLLER_DUALSHOCK4 && host_slots[bb_slot_current()].ds4_rumble_retry))) return;
         rumble_active = false;
         rumble_active_strength = 0;
         rumble_refresh_at = 0;
@@ -1087,6 +1108,7 @@ static bool same_address(const uint8_t a[6], const uint8_t b[6]) {
 }
 
 static bool reconnect_blocked(const uint8_t addr[6]) {
+    if (recovery_waiting()) return true;
     if (!reconnect_block_until) return false;
     uint32_t now = btstack_run_loop_get_time_ms();
     if ((int32_t)(reconnect_block_until - now) <= 0) {
@@ -1214,6 +1236,7 @@ static bool accept_ble_advertisement(const uint8_t addr[6], bd_addr_type_t type,
 }
 
 static bool controller_transport_ready(void) {
+    if (recovery_waiting()) return false;
     return bb_usb_ready() || bb_output_mode() == BB_OUTPUT_XBOX360;
 }
 
@@ -1221,7 +1244,7 @@ static bool accept_candidate(const uint8_t addr[6], const char* name, bool proto
     if (!controller_transport_ready()) return false;
     if (bb_blocked_device_contains(addr)) return false;
     if (reconnect_blocked(addr)) return false;
-    if (bb_multi_mode() && slot_for_address(addr) >= 0) return false;
+    if (bb_multi_transport_mode() && slot_for_address(addr) >= 0) return false;
     if (remembered_address(addr)) return true;
     if (!pairing) return false;
     return protocol_hint || likely_controller_name(name);
@@ -1251,7 +1274,7 @@ static void refresh_classic_identity(const char* name, uint16_t vid, uint16_t pi
 static void classic_identity_result_impl(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size);
 static void classic_identity_result(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size) {
     uint8_t previous = bb_slot_current();
-    int slot = bb_multi_mode() ? (sdp_owner) : 0;
+    int slot = bb_multi_transport_mode() ? (sdp_owner) : 0;
     if (slot < 0) return;
     bb_slot_enter((uint8_t)slot);
     classic_identity_result_impl(packet_type, channel, packet, size);
@@ -1310,6 +1333,11 @@ static void service_classic_identity(void) {
 }
 
 static void activate_controller(const uint8_t addr[6], uint8_t address_type, uint16_t vid, uint16_t pid, const char* name) {
+    if (recovery_waiting()) {
+        if (classic_hid_cid) hid_host_disconnect(classic_hid_cid);
+        if (le_handle != HCI_CON_HANDLE_INVALID) gap_disconnect(le_handle);
+        return;
+    }
     bd_addr_t identity_addr;
     memcpy(identity_addr, addr, 6);
     if (le_handle != HCI_CON_HANDLE_INVALID) {
@@ -1349,7 +1377,7 @@ static void activate_controller(const uint8_t addr[6], uint8_t address_type, uin
     if (vid == 0x2dc8 && pid == 0x3019) identity_name = "8BitDo 64";
     bb_controller_display_name(current_identity.kind, identity_name, current_identity.name, sizeof(current_identity.name));
     uint8_t controller_index = 0;
-    if (bb_multi_mode()) {
+    if (bb_multi_transport_mode()) {
         int slot = slot_for_address_except(identity_addr, bb_slot_current());
         if (slot >= 0) {
             if (classic_hid_cid) hid_host_disconnect(classic_hid_cid);
@@ -1382,7 +1410,14 @@ static void activate_controller(const uint8_t addr[6], uint8_t address_type, uin
         wiiu_setup_step = 1;
         wiiu_setup_at = btstack_run_loop_get_time_ms();
     }
-    bb_state_set_controller(true, controller_index, current_identity.name);
+    bool newly_connected = bb_state_set_controller(true, controller_index, current_identity.name);
+    if (newly_connected && !bb_multi_mode()) {
+        // A non-MiSTer override owns the single USB controller, including slot 1.
+        for (uint8_t i=0;i<BB_MAX_SLOTS;++i) {
+            bb_runtime_state_t peer;bb_state_get_slot(i,&peer);
+            if(i!=bb_slot_current() && peer.controller_connected) multi_disconnect_requests[i]=true;
+        }
+    }
     bb_state_set_scanning(false);
     bb_state_set_pairing(false);
     pairing = false;
@@ -1395,7 +1430,7 @@ static void activate_controller(const uint8_t addr[6], uint8_t address_type, uin
     gap_discoverable_control(1);
     scanning = false;
     last_controller_report_at = btstack_run_loop_get_time_ms();
-    if (!bb_multi_mode() && bb_output_mode() == BB_OUTPUT_MISTER && old_identity != bb_current_mister_identity()) bb_usb_request_reenumeration();
+    if (!bb_multi_transport_mode() && bb_output_mode() == BB_OUTPUT_MISTER && old_identity != bb_current_mister_identity()) bb_usb_request_reenumeration();
     if (bb_multi_mode()) {
         connection_settle_started = btstack_run_loop_get_time_ms();
         connection_settle_active = true;
@@ -1437,6 +1472,8 @@ static void controller_disconnected(bool link_closed) {
     ds4_activation_pending = false;
     ds4_activation_step = 0;
     host_slots[bb_slot_current()].ds4_lightbar_valid=false;
+    host_slots[bb_slot_current()].ds4_rumble_retry=false;
+    host_slots[bb_slot_current()].ds4_motors_sent=(bb_ds4_motors_t){0};
     host_slots[bb_slot_current()].ds4_low_battery=false;
     host_slots[bb_slot_current()].ds4_blink_sent=false;
     host_slots[bb_slot_current()].ds4_lightbar_retry_at=0;
@@ -1520,11 +1557,11 @@ static void start_classic_inquiry(void) {
 static void start_scans(void) {
     if (multi_discovery_paused(btstack_run_loop_get_time_ms())) return;
     if (!stack_ready || connection_in_progress() || free_slot() < 0) return;
-    bool busy = bb_multi_mode() && connected_controller_present();
+    bool busy = bb_multi_transport_mode() && connected_controller_present();
     if (scanning && scan_busy != busy) stop_scans();
     if (!scanning) {
         scanning = true;
-        if (bb_multi_mode()) {
+        if (bb_multi_transport_mode()) {
             discovery_started_at = btstack_run_loop_get_time_ms();
             discovery_window_active = true;
         }
@@ -1561,7 +1598,7 @@ static void connect_classic(const uint8_t addr[6], const char* name) {
     copy_name(pending_name, sizeof(pending_name), name);
     pending_vid = 0;
     pending_pid = 0;
-    gap_set_page_timeout(bb_multi_mode() && !pairing ? 4800u : 0x6000u);
+    gap_set_page_timeout(bb_multi_transport_mode() && !pairing ? 4800u : 0x6000u);
     uint8_t status = hid_host_connect(pending_addr, HID_PROTOCOL_MODE_REPORT, &classic_hid_cid);
     if (status != ERROR_CODE_SUCCESS) {
         classic_connecting = false;
@@ -1618,7 +1655,7 @@ static void connect_ble(const uint8_t addr[6], bd_addr_type_t addr_type, const c
 static void nintendo_gatt_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size);
 static void nintendo_gatt_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size) {
     uint8_t previous = bb_slot_current();
-    int slot = bb_multi_mode() ? (size >= 4 ? slot_for_handle(little_endian_read_16(packet, 2)) : -1) : 0;
+    int slot = bb_multi_transport_mode() ? (size >= 4 ? slot_for_handle(little_endian_read_16(packet, 2)) : -1) : 0;
     if (slot < 0) return;
     bb_slot_enter((uint8_t)slot);
     nintendo_gatt_handler_impl(packet_type, channel, packet, size);
@@ -1803,7 +1840,7 @@ static void ultimate2c_protocol_finish(void) {
 static void ultimate2c_protocol_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size);
 static void ultimate2c_protocol_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size) {
     uint8_t previous = bb_slot_current();
-    int slot = bb_multi_mode() ? (size >= 4 ? slot_for_handle(little_endian_read_16(packet, 2)) : -1) : 0;
+    int slot = bb_multi_transport_mode() ? (size >= 4 ? slot_for_handle(little_endian_read_16(packet, 2)) : -1) : 0;
     if (slot < 0) return;
     bb_slot_enter((uint8_t)slot);
     ultimate2c_protocol_handler_impl(packet_type, channel, packet, size);
@@ -1850,7 +1887,7 @@ static void ultimate2c_protocol_handler_impl(uint8_t packet_type, uint16_t chann
 static void ble_identity_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size);
 static void ble_identity_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size) {
     uint8_t previous = bb_slot_current();
-    int slot = bb_multi_mode() ? (size >= 5 ? slot_for_handle(little_endian_read_16(packet, 3)) : -1) : 0;
+    int slot = bb_multi_transport_mode() ? (size >= 5 ? slot_for_handle(little_endian_read_16(packet, 3)) : -1) : 0;
     if (slot < 0) return;
     bb_slot_enter((uint8_t)slot);
     ble_identity_handler_impl(packet_type, channel, packet, size);
@@ -1904,7 +1941,7 @@ static void sm_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, u
             return;
         }
     }
-    int slot = bb_multi_mode() ? (size >= 5 ? slot_for_handle(little_endian_read_16(packet, 2)) : -1) : 0;
+    int slot = bb_multi_transport_mode() ? (size >= 5 ? slot_for_handle(little_endian_read_16(packet, 2)) : -1) : 0;
     if (slot < 0) return;
     bb_slot_enter((uint8_t)slot);
     sm_handler_impl(packet_type, channel, packet, size);
@@ -2246,10 +2283,10 @@ static void hci_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pac
 static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size) {
     uint8_t previous = bb_slot_current();
     if (packet_type == HCI_EVENT_PACKET && size >= 2 && packet[0] == GAP_EVENT_INQUIRY_COMPLETE) classic_inquiry_active = false;
-    int slot = bb_multi_mode() ? (route_hci(packet, size)) : 0;
+    int slot = bb_multi_transport_mode() ? (route_hci(packet, size)) : 0;
     if (slot < 0) return;
     bb_slot_enter((uint8_t)slot);
-    if (bb_multi_mode()) { bb_runtime_state_t live; bb_state_get(&live); if (live.controller_connected) current_controller_index = live.controller_index; }
+    if (bb_multi_transport_mode()) { bb_runtime_state_t live; bb_state_get(&live); if (live.controller_connected) current_controller_index = live.controller_index; }
     hci_handler_impl(packet_type, channel, packet, size);
     bb_slot_enter(previous);
 }
@@ -2379,7 +2416,7 @@ static void hci_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pac
             const uint8_t* data = gap_event_advertising_report_get_data(packet);
             uint8_t data_len = gap_event_advertising_report_get_data_length(packet);
             gap_event_advertising_report_get_address(packet, addr);
-            if (bb_multi_mode() && slot_for_address(addr) >= 0) break;
+            if (bb_multi_transport_mode() && slot_for_address(addr) >= 0) break;
             adv_name(data, data_len, name, sizeof(name));
             bool hogp = ad_data_contains_uuid16(data_len, data, ORG_BLUETOOTH_SERVICE_HUMAN_INTERFACE_DEVICE);
             bool nso_new = ad_data_contains_uuid128(data_len, data, (uint8_t*)nintendo_service_uuid);
@@ -2475,7 +2512,6 @@ static void hci_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pac
     }
 }
 
-static volatile bool multi_disconnect_requests[BB_MAX_SLOTS];
 static bool disconnect_current_impl(void);
 
 static volatile uint8_t pairing_command;
@@ -2499,7 +2535,7 @@ static void service_link_recovery(uint32_t now) {
 }
 
 static void service_slot(void) {
-    if (bb_multi_mode()) {
+    if (bb_multi_transport_mode()) {
         bb_runtime_state_t live;
         bb_state_get(&live);
         if (live.controller_connected) current_controller_index = live.controller_index;
@@ -2646,6 +2682,29 @@ static void service_slot(void) {
 }
 static void usb_watch_handler(btstack_timer_source_t* timer) {
     uint8_t previous = bb_slot_current();
+    if (recovery_command) {
+        recovery_until = btstack_run_loop_get_time_ms() + 5000u;
+        recovery_command = false;
+        pairing_command = 0;
+        pairing = false;
+        bb_state_set_pairing(false);
+        stop_scans();
+        gap_connectable_control(0);
+        gap_connect_cancel();
+        for (uint8_t i=0;i<(bb_multi_transport_mode()?BB_MAX_SLOTS:1);++i) {
+            bb_slot_enter(i);
+            multi_disconnect_requests[i] = false;
+            disconnect_current_impl();
+            if(pending_classic_handle!=HCI_CON_HANDLE_INVALID)gap_disconnect(pending_classic_handle);
+        }
+        bb_output_recover();
+        bb_slot_enter(previous);
+    }
+    if (recovery_until && !recovery_waiting()) {
+        recovery_until = 0;
+        gap_connectable_control(1);
+        start_scans();
+    }
     if (pairing_command) {
         uint8_t command = pairing_command;
         pairing_command = 0;
@@ -2668,7 +2727,7 @@ static void usb_watch_handler(btstack_timer_source_t* timer) {
     else if (usb_was_ready) {
         if (!usb_lost_since) usb_lost_since = now;
         if ((uint32_t)(now - usb_lost_since) >= 1500u) {
-            for (uint8_t i = 0; i < (bb_multi_mode() ? BB_MAX_SLOTS : 1); ++i) {
+            for (uint8_t i = 0; i < (bb_multi_transport_mode() ? BB_MAX_SLOTS : 1); ++i) {
                 bb_slot_enter(i);
                 disconnect_current_impl();
             }
@@ -2676,11 +2735,11 @@ static void usb_watch_handler(btstack_timer_source_t* timer) {
             usb_lost_since = 0;
         }
     }
-    for (uint8_t i = 0; i < (bb_multi_mode() ? BB_MAX_SLOTS : 1); ++i) {
+    for (uint8_t i = 0; i < (bb_multi_transport_mode() ? BB_MAX_SLOTS : 1); ++i) {
         bb_slot_enter(i);
         service_slot();
     }
-    if ((pairing || bb_multi_mode()) && !connection_in_progress() && free_slot() >= 0 && controller_transport_ready()) start_scans();
+    if ((pairing || bb_multi_transport_mode()) && !connection_in_progress() && free_slot() >= 0 && controller_transport_ready()) start_scans();
     bb_slot_enter(previous);
     btstack_run_loop_set_timer(timer, 100);
     btstack_run_loop_add_timer(timer);
@@ -2803,7 +2862,7 @@ static void stop_pairing_impl(void) {
 
 static void forget_all_impl(void) {
     uint8_t previous = bb_slot_current();
-    for (uint8_t i = 0; i < (bb_multi_mode() ? BB_MAX_SLOTS : 1); ++i) {
+    for (uint8_t i = 0; i < (bb_multi_transport_mode() ? BB_MAX_SLOTS : 1); ++i) {
         bb_slot_enter(i);
         if (classic_hid_cid) hid_host_disconnect(classic_hid_cid);
         if (le_handle != HCI_CON_HANDLE_INVALID) gap_disconnect(le_handle);
@@ -2838,6 +2897,11 @@ static bool forget_device_impl(const uint8_t address[6]) {
     }
     start_scans();
     return true;
+}
+
+void bb_bt_host_recover_output(void) {
+    // Run all Bluetooth operations on its run loop, rather than the USB core.
+    recovery_command = true;
 }
 
 bool bb_bt_host_disconnect_current(void) {
@@ -2897,12 +2961,7 @@ bool bb_bt_host_rumble_test(uint8_t strength, uint16_t duration_ms) {
 }
 
 void bb_bt_host_set_output_rumble(uint8_t left, uint8_t right) {
-    uint8_t strength = left > right ? left : right;
-    rumble_request_strength = strength;
-    rumble_request_big = left;
-    rumble_request_small = right;
-    rumble_request_duration_ms = strength ? 1200u : 50u;
-    rumble_request_pending = true;
+    bb_bt_host_set_slot_rumble(bb_output_slot(), left, right);
 }
 
 // strength drives single-strength controllers (unchanged behaviour); big/small drive controllers
@@ -2913,7 +2972,7 @@ void bb_bt_host_set_slot_rumble_motors(uint8_t slot, uint8_t strength, uint8_t b
     context->queued_strength = strength;
     context->queued_big = big;
     context->queued_small = small;
-    context->queued_duration = strength ? 1200u : 50u;
+    context->queued_duration = (strength||big||small) ? 1200u : 50u;
     context->queued_pending = true;
 }
 
